@@ -3,5 +3,10 @@ name = "spark-lineage"
 version = "0.1.0"
 description = "Runtime column-level lineage tracking for PySpark DataFrames"
 readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = ["pyspark>=3.3"]
+
+[project.urls]
+Homepage = "https://github.com/nitrajen/spark-lineage"
+Repository = "https://github.com/nitrajen/spark-lineage"
