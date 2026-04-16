@@ -1,0 +1,7 @@
+[project]
+name = "spark-lineage"
+version = "0.1.0"
+description = "Runtime column-level lineage tracking for PySpark DataFrames"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyspark>=3.3"]
