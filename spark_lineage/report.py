@@ -98,6 +98,44 @@ def save_report(source_df, path: str, name: str = None):
 # ── JSON builder ──────────────────────────────────────────────────────────────
 
 def _build_json(source_id: str, source_df, title: str) -> dict:
+    """
+    Builds a self-contained lineage document.
+
+    Top-level shape
+    ───────────────
+    {
+      meta:    report metadata
+      sources: [                    ← every source DataFrame that fed any target
+        {
+          id, name, primary,        ← primary=true for the source_df passed in
+          caller,                   ← file:line where track_df() was called
+          columns,                  ← column list in schema order
+          influence: {              ← for each source column …
+            col: {                  ←   … which target IDs it reached …
+              target_id: [cols]     ←   … and which target columns it influenced
+            }
+          }
+        }
+      ]
+      targets: [                    ← every leaf (materialized) DataFrame
+        {
+          id, label, caller,
+          source_dfs,               ← subset of sources[] that fed this target
+          columns,                  ← column list in schema order
+          col_roles: {col: role},   ← role per column: created|modified|passthrough
+          traces: {                 ← full trace per column
+            col: {
+              expr,                 ← expression string (for created cols)
+              sources,              ← ultimate source columns that contributed
+              steps: [              ← one step per ancestor node that touches this col
+                { operation, role, name, args, caller, context_key }
+              ]
+            }
+          }
+        }
+      ]
+    }
+    """
     source_node = _registry.get(source_id)
     try:
         source_cols = list(source_df.columns)
@@ -106,9 +144,8 @@ def _build_json(source_id: str, source_df, title: str) -> dict:
 
     leaf_ids = _registry.get_leaf_descendants(source_id)
 
-    targets: list[dict] = []
-    traces:  dict       = {}
-    all_source_ids: dict[str, dict] = {}
+    targets: list[dict]          = []
+    all_src_map: dict[str, dict] = {}   # id → source entry (built incrementally)
 
     for tid in leaf_ids:
         node = _registry.get(tid)
@@ -118,65 +155,65 @@ def _build_json(source_id: str, source_df, title: str) -> dict:
         ancestor_nodes = _get_all_ancestor_nodes(tid)
         col_src_map    = _build_col_source_map(ancestor_nodes)
 
-        # Which source DFs contributed to this specific target?
+        # Collect source DFs for this target + register in global map
         target_source_dfs: list[dict] = []
         for an in ancestor_nodes:
             if an.operation is None:
-                sf = {"id": an.id, "name": an.name, "columns": list(an.output_cols)}
-                target_source_dfs.append(sf)
-                if an.id not in all_source_ids:
-                    all_source_ids[an.id] = {
+                target_source_dfs.append({
+                    "id":     an.id,
+                    "name":   an.name,
+                    "caller": _caller_dict(an.caller),
+                })
+                if an.id not in all_src_map:
+                    all_src_map[an.id] = {
                         "id":      an.id,
                         "name":    an.name,
-                        "columns": list(an.output_cols),
                         "primary": an.id == source_id,
+                        "caller":  _caller_dict(an.caller),
+                        "columns": list(an.output_cols),
                     }
 
-        label = _node_label(node, tid)
+        # Per-column traces + role map
+        col_traces: dict[str, dict] = {}
+        col_roles:  dict[str, str]  = {}
+        for col in node.output_cols:
+            trace = _build_col_trace(col, ancestor_nodes, col_src_map)
+            col_traces[col] = trace
+            steps = trace.get("steps", [])
+            if any(s["role"] == "created"  for s in steps): col_roles[col] = "created"
+            elif any(s["role"] == "modified" for s in steps): col_roles[col] = "modified"
+            else: col_roles[col] = "passthrough"
+
         targets.append({
             "id":         tid,
-            "label":      label,
+            "label":      _node_label(node, tid),
             "name":       node.name,
-            "columns":    list(node.output_cols),
             "caller":     _caller_dict(node.caller),
             "source_dfs": target_source_dfs,
+            "columns":    list(node.output_cols),
+            "col_roles":  col_roles,
+            "traces":     col_traces,
         })
 
-        traces[tid] = {}
-        for col in node.output_cols:
-            traces[tid][col] = _build_col_trace(col, ancestor_nodes, col_src_map)
-
-    # Order: primary source first, then alphabetically by name
-    all_sources = sorted(
-        all_source_ids.values(),
+    # Order: primary first, then alphabetically
+    sources = sorted(
+        all_src_map.values(),
         key=lambda s: (0 if s["primary"] else 1, s["name"] or "")
     )
 
-    # Influence maps for ALL source DataFrames (not just the primary)
-    all_source_influence: dict[str, dict] = {}
-    for src in all_sources:
-        all_source_influence[src["id"]] = _compute_source_influence(
-            src["columns"], targets, traces
-        )
+    # Embed influence inside each source entry
+    for src in sources:
+        src["influence"] = _compute_source_influence(src["id"], src["columns"], targets)
 
     return {
         "meta": {
             "title":        title,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "source_count": len(sources),
             "target_count": len(targets),
-            "source_count": len(all_sources),
         },
-        "source": {
-            "id":      source_id,
-            "name":    source_node.name if source_node else None,
-            "columns": source_cols,
-        },
-        "all_sources":          all_sources,
-        "all_source_influence": all_source_influence,
-        # backward-compat key for the primary source
-        "source_influence": all_source_influence.get(source_id, {}),
+        "sources": sources,
         "targets": targets,
-        "traces":  traces,
     }
 
 
@@ -192,15 +229,23 @@ def _node_label(node: LineageNode, nid: str) -> str:
 def _caller_dict(caller) -> dict | None:
     if caller is None:
         return None
+    module   = caller.module or ""
+    qualname = caller.qualname or ""
+    # Drop Python's "<module>" placeholder — module-level code just uses the module name
+    qname_clean = qualname if (qualname and qualname != "<module>") else ""
+    parts = [p for p in [module, qname_clean] if p]
+    # Fully qualified identifier: module.qualname:line — unambiguous across any codebase
+    fqn = ".".join(parts) + ":" + str(caller.line) if parts else None
     return {
-        "module":     caller.module,
-        "klass":      caller.klass,
-        "func":       caller.function,
-        "qualname":   caller.qualname,
-        "file":       caller.file,
-        "file_short": caller.file.split("/")[-1],
-        "line":       caller.line,
-        "context_key": caller.qualname,   # stable grouping key for JS
+        "module":      caller.module,
+        "klass":       caller.klass,
+        "func":        caller.function,
+        "qualname":    caller.qualname,
+        "fqn":         fqn,
+        "file":        caller.file,
+        "file_short":  caller.file.split("/")[-1],
+        "line":        caller.line,
+        "context_key": caller.qualname,
     }
 
 
@@ -242,14 +287,15 @@ def _get_all_ancestor_nodes(target_id: str) -> list[LineageNode]:
 
 def _build_col_source_map(ancestor_nodes: list[LineageNode]) -> dict:
     """
-    Build {col_name: set_of_ultimate_source_cols} from ALL ancestor nodes.
-    Seeds from every root node (primary source + any joined DataFrames).
+    Build {col_name: set_of_(src_node_id, src_col)} from ALL ancestor nodes.
+    Tracks source attribution as (source_df_id, col_name) tuples so that
+    same-named columns in different source DataFrames are not confused.
     """
     csm: dict[str, set] = {}
     for node in ancestor_nodes:
         if node.operation is None:
             for col in node.output_cols:
-                csm[col] = {col}
+                csm[col] = {(node.id, col)}   # (source_df_id, col_name)
 
     for node in ancestor_nodes:
         if node.operation is None:
@@ -285,7 +331,23 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
     """
     steps = []
     expr: str = col
-    sources: list[str] = sorted(col_src_map.get(col, set())) if col_src_map else []
+    # sources: list of {src_id, col, src_name} — explicit source DF attribution
+    if col_src_map:
+        raw_pairs = sorted(col_src_map.get(col, set()), key=lambda t: t[1] if isinstance(t, tuple) else t)
+        sources: list = []
+        for item in raw_pairs:
+            if isinstance(item, tuple):
+                src_id, src_col = item
+                src_node = _registry.get(src_id)
+                sources.append({
+                    "src_id":   src_id,
+                    "col":      src_col,
+                    "src_name": src_node.name if src_node else None,
+                })
+            else:
+                sources.append({"src_id": None, "col": item, "src_name": None})
+    else:
+        sources = []
 
     for node in ancestor_nodes:
         if col not in (node.output_cols or []):
@@ -322,9 +384,11 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
     return {"expr": expr, "sources": sources, "steps": steps}
 
 
-def _compute_source_influence(source_cols: list, targets: list, traces: dict) -> dict:
+def _compute_source_influence(src_id: str, source_cols: list, targets: list) -> dict:
     """
     Returns {source_col: {target_id: [influenced_target_cols]}}.
+    Matches by (src_id, col) pairs to avoid cross-attributing same-named columns
+    from different source DataFrames.
     """
     influence: dict = {}
     for sc in source_cols:
@@ -333,14 +397,23 @@ def _compute_source_influence(source_cols: list, targets: list, traces: dict) ->
             tid = t["id"]
             influenced = []
             for col in t["columns"]:
-                trace = (traces.get(tid) or {}).get(col)
+                trace = (t.get("traces") or {}).get(col)
                 if trace is None:
                     continue
-                steps   = trace.get("steps", [])
-                sources = trace.get("sources", [])
-                if sc in sources:
+                src_pairs = trace.get("sources", [])
+                steps     = trace.get("steps", [])
+                # Match on exact (source_df_id, col_name) pair
+                if any(
+                    isinstance(p, dict) and p.get("src_id") == src_id and p.get("col") == sc
+                    for p in src_pairs
+                ):
                     influenced.append(col)
-                elif col == sc and steps and steps[0].get("role") == "source":
+                elif (
+                    col == sc
+                    and steps
+                    and steps[0].get("role") == "source"
+                    and steps[0].get("name") == (_registry.get(src_id).name if _registry.get(src_id) else None)
+                ):
                     influenced.append(col)
             if influenced:
                 influence[sc][tid] = influenced
@@ -379,34 +452,46 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* section label */
 .sec{padding:7px 14px;font-size:.6rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;background:#0d1117;border-bottom:1px solid #1a2235;flex-shrink:0}
 
-/* source block */
-#src-block{border-bottom:1px solid #1a2235;flex-shrink:0;overflow-y:auto;max-height:240px}
-.src-entry{padding:8px 14px;border-bottom:1px solid #111827}
+/* source block (accordion) */
+#src-block{border-bottom:1px solid #1a2235;flex:0 1 auto;overflow-y:auto;max-height:28%;min-height:40px}
+.src-entry{border-bottom:1px solid #111827}
 .src-entry:last-child{border-bottom:none}
-.src-df-name{font-size:.75rem;font-weight:700;color:#7dd3fc;margin-bottom:5px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px}
-.src-df-name.secondary{color:#4b5563;font-size:.7rem}
-.src-df-name.active{color:#38bdf8}
-.src-df-name .src-dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex-shrink:0}
-.src-cols{display:flex;flex-wrap:wrap;gap:3px}
+.src-df-header{padding:7px 14px;cursor:pointer;user-select:none;display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;transition:background .1s;border-left:2px solid transparent}
+.src-df-header:hover{background:#1a2235}
+.src-df-chevron{font-size:.6rem;color:#374151;width:12px;flex-shrink:0;transition:transform .15s}
+.src-df-header.expanded .src-df-chevron{transform:rotate(90deg)}
+.src-df-label{font-size:.73rem;font-weight:700;color:#7dd3fc;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.src-df-header.secondary .src-df-label{color:#94a3b8}
+.src-df-loc{font-size:.6rem;color:#374151;white-space:nowrap}
+.src-df-fqn{font-size:.62rem;color:#64748b;font-family:'SF Mono',Consolas,monospace;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-right:4px}
+.src-df-header.selected{background:#0c1f38;border-left:2px solid #38bdf8}
+.src-df-header.selected .src-df-label{color:#7dd3fc}
+.src-cols-wrap{padding:4px 14px 8px 30px;display:none;flex-wrap:wrap;gap:3px}
+.src-cols-wrap.open{display:flex}
 .col-chip{font-size:.6rem;padding:1px 7px;border-radius:9px;background:#1a2235;color:#64748b;border:1px solid #21283a;white-space:nowrap;cursor:pointer;transition:all .15s}
 .col-chip:hover{background:#1e2d40;color:#94a3b8;border-color:#2d3f55}
-.col-chip.selected{background:#1e3a5f;color:#7dd3fc;border-color:#38bdf8}
+.col-chip.tracked{background:#1e3a5f;color:#7dd3fc;border-color:#38bdf8;box-shadow:0 0 0 1px #38bdf8}
 .col-chip.trace-source{background:#052e16;color:#34d399;border-color:#166534}
 
 /* targets list */
-#targets-wrap{flex:1;overflow-y:auto;padding:4px 0}
+#targets-wrap{flex:1 0 100px;overflow-y:auto;padding:4px 0}
 .target-item{padding:7px 14px;cursor:pointer;border-left:2px solid transparent;transition:all .1s}
 .target-item:hover{background:#1a2235}
 .target-item.active{background:#1e2d40;border-left-color:#38bdf8}
-.t-label{font-size:.75rem;color:#94a3b8;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-label{font-size:.75rem;color:#94a3b8;font-weight:500;word-break:break-word;line-height:1.4}
 .t-sub{font-size:.62rem;color:#374151;margin-top:1px}
 .target-item.dim{opacity:.22}
 .target-item.influenced .t-label{color:#7dd3fc}
-.t-influence-badge{display:none;font-size:.58rem;color:#38bdf8;background:#0c2340;border:1px solid #1d4ed8;border-radius:9px;padding:1px 6px;margin-top:3px}
-.target-item.influenced .t-influence-badge{display:inline-block}
+/* Source DF chips — always shown under every target.
+   sel = currently selected source (bright), unsel = real source but not selected (dimmed) */
+.t-influence-badge{display:flex;flex-wrap:wrap;gap:2px;margin-top:3px}
+.t-src-chip{font-size:.55rem;padding:1px 6px;border-radius:7px;white-space:nowrap}
+.t-src-chip.sel{color:#38bdf8;background:#0c2340;border:1px solid #1d4ed8}
+.t-src-chip.unsel{color:#374151;background:transparent;border:1px solid #1e2d40}
+.t-cols-badge{font-size:.55rem;color:#34d399;background:#052e16;border:1px solid #166534;border-radius:7px;padding:1px 5px;margin-left:2px}
 
 /* columns panel */
-#cols-panel{border-top:1px solid #1a2235;max-height:44%;display:flex;flex-direction:column;flex-shrink:0}
+#cols-panel{border-top:1px solid #1a2235;flex:0 1 auto;max-height:30%;min-height:60px;display:flex;flex-direction:column}
 #col-search-wrap{padding:6px 10px;border-bottom:1px solid #1a2235;flex-shrink:0}
 #col-search{width:100%;background:#161b27;border:1px solid #21283a;color:#e2e8f0;border-radius:4px;padding:4px 8px;font-size:.68rem;outline:none}
 #col-search:focus{border-color:#2d3f55}
@@ -422,7 +507,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* target overview */
 .t-overview{max-width:860px}
 .t-ov-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;gap:14px}
-.t-ov-title{font-size:1.15rem;font-weight:700;color:#e2e8f0;margin-bottom:3px;word-break:break-all}
+.t-ov-title{font-size:1.15rem;font-weight:700;color:#e2e8f0;margin-bottom:3px;word-break:break-word;line-height:1.4}
 .t-ov-sub{font-size:.72rem;color:#4b5563}
 .t-ov-stats{display:flex;flex-wrap:wrap;gap:0;margin-bottom:16px}
 .t-ov-stat{display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:.68rem;color:#4b5563}
@@ -438,8 +523,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-ov-chip.passthrough{background:#1a2235;color:#4b5563;border:1px solid #21283a}
 .t-ov-chip.hl{box-shadow:0 0 0 2px #38bdf8}
 .src-df-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:4px}
-.src-df-chip{display:inline-block;font-size:.65rem;color:#7dd3fc;background:#0c2340;padding:2px 10px;border-radius:9px;border:1px solid #1d4ed8;cursor:pointer}
-.src-df-chip:hover{opacity:.8}
+.src-df-chip{display:inline-block;font-size:.65rem;padding:2px 10px;border-radius:9px;cursor:default;white-space:nowrap}
+.src-df-chip.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
+.src-df-chip.unsel{color:#4b5563;background:#111827;border:1px solid #1e2d40}
+.src-df-chip-loc{font-size:.58rem;color:#374151;margin-left:3px}
+
+/* infl summary */
+.infl-summary{margin-top:4px;margin-bottom:6px;padding:8px 10px;background:#0c1f38;border:1px solid #1d4ed8;border-radius:6px;font-size:.65rem;color:#7dd3fc}
+/* not-influenced banner */
+.not-infl-banner{margin:8px 0;padding:7px 12px;background:#1a1206;border:1px solid #78350f;border-radius:6px;font-size:.65rem;color:#d97706}
+/* per-source-column attribution rows inside infl-summary */
+.src-col-attr-row{display:flex;flex-wrap:wrap;align-items:flex-start;gap:4px;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #1a3050}
+.src-col-attr-row:last-child{margin-bottom:0;padding-bottom:0;border-bottom:none}
+.src-col-attr-lhs{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.src-col-name{font-size:.65rem;font-weight:700;color:#34d399;background:#052e16;padding:2px 8px;border-radius:9px;border:1px solid #166534}
+.src-col-df-name{font-size:.58rem;color:#4b5563}
+.src-col-arrow{color:#374151;font-size:.65rem;margin:0 2px}
+.src-col-tgt-chips{display:flex;flex-wrap:wrap;gap:3px}
+.infl-col-chip{font-size:.6rem;padding:1px 7px;border-radius:9px;background:#1e3a5f;color:#38bdf8;border:1px solid #2563eb;cursor:pointer;white-space:nowrap}
+.infl-col-chip:hover{opacity:.8}
+.no-infl-note{font-size:.6rem;color:#374151;font-style:italic}
+.infl-cols{display:flex;flex-wrap:wrap;gap:3px;margin-top:5px}
 
 /* download bar */
 .dl-bar{display:flex;gap:6px;flex-shrink:0}
@@ -514,29 +618,40 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     </div>
   </div>
   <div id="drag"></div>
-  <div id="main"><p class="empty-msg">Select a target to explore its lineage</p></div>
+  <div id="main"><p class="empty-msg">Select a source column to track its influence, or a target to inspect it.</p></div>
 </div>
 <script>
 // >>SPARK_LINEAGE_DATA<<
 const DATA = __DATA__;
 // >>END_SPARK_LINEAGE_DATA<<
 
+// ── fast lookups (built once at init) ─────────────────────────────────────
+const SRC_MAP = {};
+const TGT_MAP = {};
+const COL_TO_SRC_ID = {};
+DATA.sources.forEach(s => {
+  SRC_MAP[s.id] = s;
+  (s.columns || []).forEach(c => { if (!COL_TO_SRC_ID[c]) COL_TO_SRC_ID[c] = s.id; });
+});
+DATA.targets.forEach(t => { TGT_MAP[t.id] = t; });
+
 // ── application state ──────────────────────────────────────────────────────
+// Hierarchical selection: source DFs → source columns → target → target column
+//
+// activeSrcIds   : Set<srcId>  — source DFs whose accordion is open / selected
+//                  DF mode: highlight targets that are fed by ALL selected DFs (AND)
+// activeSrcCols  : Map<"srcId|col", {srcId, col}> — multi-selected source columns
+//                  Column mode: highlight targets/cols influenced by ANY selected col (OR)
+// activeTarget   : selected target DF id
+// activeCol      : selected target column
 const STATE = {
-  srcId:  null,   // active source DataFrame id
-  srcCol: null,   // active source column name
-  tid:    null,   // active target id
-  col:    null,   // active target column
+  activeSrcIds:  new Set(),   // DF multi-select (AND filter on targets)
+  activeSrcCols: new Map(),   // column multi-select: key = "srcId|col"
+  activeTarget:  null,
+  activeCol:     null,
 };
 
-// per-group collapse state: context_key → bool (true = collapsed)
 const GRP_COLLAPSED = {};
-
-// lookup: source col name → source DF id (first match)
-const COL_TO_SRC_ID = {};
-(DATA.all_sources || []).forEach(src => {
-  (src.columns || []).forEach(c => { if (!COL_TO_SRC_ID[c]) COL_TO_SRC_ID[c] = src.id; });
-});
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function esc(s) {
@@ -544,14 +659,59 @@ function esc(s) {
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function getInfluence(srcId, col) {
-  return ((DATA.all_source_influence || {})[srcId] || {})[col] || {};
+// Returns influence map for the current selection:
+// - Column mode (source cols selected): {targetId: [influencedCols]} — UNION across all selected cols
+// - DF mode (source DFs selected, no cols): {targetId: []} — AND: target must use ALL selected DFs
+// - null if nothing selected
+function currentInfluence() {
+  // Column mode — union of influences from every selected source column
+  if (STATE.activeSrcCols.size > 0) {
+    const result = {};
+    STATE.activeSrcCols.forEach(({srcId, col}) => {
+      const colInfl = ((SRC_MAP[srcId] || {}).influence || {})[col] || {};
+      Object.entries(colInfl).forEach(([tid, cols]) => {
+        if (!result[tid]) result[tid] = new Set();
+        cols.forEach(c => result[tid].add(c));
+      });
+    });
+    // Convert Sets to arrays
+    const out = {};
+    Object.entries(result).forEach(([tid, set]) => { out[tid] = [...set]; });
+    return out;
+  }
+
+  if (STATE.activeSrcIds.size === 0) return null;
+
+  // DF mode — AND: only targets that are fed by EVERY selected source DF
+  // (selecting orders + customers → only targets that use both)
+  const allSrcIds = Array.from(STATE.activeSrcIds);
+  let candidateTids = null;
+  allSrcIds.forEach(srcId => {
+    const src = SRC_MAP[srcId];
+    if (!src) return;
+    const thisTids = new Set();
+    Object.values(src.influence || {}).forEach(tgtMap => {
+      Object.keys(tgtMap).forEach(tid => thisTids.add(tid));
+    });
+    candidateTids = candidateTids === null
+      ? thisTids
+      : new Set([...candidateTids].filter(tid => thisTids.has(tid)));
+  });
+  const result = {};
+  (candidateTids || new Set()).forEach(tid => { result[tid] = []; });
+  return result;
 }
 
-function currentInfluence() {
-  if (!STATE.srcId || !STATE.srcCol) return null;
-  const infl = getInfluence(STATE.srcId, STATE.srcCol);
-  return Object.keys(infl).length ? infl : {};
+// Which selected source DF names feed a given target (for DF-mode badges)
+// Use t.source_dfs (ancestor-based) instead of influence map so that
+// sources contributing only count(*) or join keys aren't silently dropped.
+function feedingSrcNames(tid) {
+  const t = TGT_MAP[tid];
+  if (!t) return [];
+  const tgtSrcIds = new Set((t.source_dfs || []).map(s => s.id));
+  return Array.from(STATE.activeSrcIds)
+    .filter(sid => tgtSrcIds.has(sid))
+    .map(sid => (SRC_MAP[sid] || {}).name || sid.slice(0, 6));
 }
 
 function targetName(t) {
@@ -562,8 +722,16 @@ function targetName(t) {
 function targetSub(t) {
   return t.caller ? t.caller.file_short + ':' + t.caller.line : '';
 }
-function srcName(src) {
-  return src.name || src.id.slice(0, 8);
+function srcDisplayName(src) {
+  const name = src.name || null;
+  const loc  = src.caller ? src.caller.file_short + ':' + src.caller.line : null;
+  if (name && loc) return name + ' \\u00b7 ' + loc;
+  if (name)        return name;
+  if (loc)         return loc;
+  return src.id.slice(0, 8);
+}
+function srcShortName(src) {
+  return src.name || (src.caller ? src.caller.file_short : src.id.slice(0, 8));
 }
 
 // ── init header ───────────────────────────────────────────────────────────
@@ -571,28 +739,50 @@ document.getElementById('pg-title').textContent = DATA.meta.title;
 document.getElementById('pg-sub').textContent =
   DATA.targets.length + ' target' + (DATA.targets.length !== 1 ? 's' : '');
 document.getElementById('src-count').textContent =
-  '(' + (DATA.all_sources ? DATA.all_sources.length : 1) + ')';
+  '(' + DATA.sources.length + ')';
 document.getElementById('t-count').textContent =
   '(' + DATA.targets.length + ')';
 
-// ── build source panel ─────────────────────────────────────────────────────
+// ── source panel ───────────────────────────────────────────────────────────
+// Clicking a source DF header selects/deselects it (multi-select) AND expands/collapses columns.
+// Clicking a column chip tracks that column's influence (single column at a time).
 function buildSourcePanel() {
   const block = document.getElementById('src-block');
   block.innerHTML = '';
-  (DATA.all_sources || [DATA.source]).forEach(src => {
+  DATA.sources.forEach(src => {
     const entry = document.createElement('div');
     entry.className = 'src-entry';
+    entry.dataset.srcId = src.id;
 
-    const nameEl = document.createElement('div');
-    nameEl.className = 'src-df-name' + (src.primary === false ? ' secondary' : '');
-    nameEl.id = 'sdf_' + src.id;
-    nameEl.innerHTML = '<span class="src-dot"></span>' + esc(srcName(src));
-    nameEl.title = src.primary ? 'Primary source' : 'Contributing source (joined)';
-    nameEl.onclick = () => selectSrcDF(src.id);
-    entry.appendChild(nameEl);
+    const hdr = document.createElement('div');
+    hdr.className = 'src-df-header' + (src.primary ? '' : ' secondary');
+    hdr.id = 'srchdr_' + src.id;
 
-    const colsEl = document.createElement('div');
-    colsEl.className = 'src-cols';
+    const chevron = document.createElement('span');
+    chevron.className = 'src-df-chevron';
+    chevron.textContent = '\\u25B6';
+
+    const labelEl = document.createElement('span');
+    labelEl.className = 'src-df-label';
+    labelEl.textContent = src.name || src.id.slice(0, 8);
+
+    hdr.appendChild(chevron);
+    hdr.appendChild(labelEl);
+
+    // Fully qualified name: module.qualname:line — unambiguous DF identifier
+    if (src.caller && src.caller.fqn) {
+      const fqnEl = document.createElement('div');
+      fqnEl.className = 'src-df-fqn';
+      fqnEl.textContent = src.caller.fqn;
+      hdr.appendChild(fqnEl);
+    }
+
+    hdr.onclick = () => toggleSrcSelect(src.id);
+    entry.appendChild(hdr);
+
+    const colsWrap = document.createElement('div');
+    colsWrap.className = 'src-cols-wrap';
+    colsWrap.id = 'srccols_' + src.id;
     (src.columns || []).forEach(c => {
       const chip = document.createElement('span');
       chip.className = 'col-chip';
@@ -601,107 +791,163 @@ function buildSourcePanel() {
       chip.dataset.srcId = src.id;
       chip.dataset.col   = c;
       chip.onclick = e => { e.stopPropagation(); selectSrcCol(src.id, c); };
-      colsEl.appendChild(chip);
+      colsWrap.appendChild(chip);
     });
-    entry.appendChild(colsEl);
+    entry.appendChild(colsWrap);
     block.appendChild(entry);
   });
 }
 
-// ── source selection ───────────────────────────────────────────────────────
-function selectSrcDF(srcId) {
-  if (STATE.srcId === srcId && STATE.srcCol === null) {
-    STATE.srcId = null;
+// Toggle selection+expansion of a source DF (multi-select)
+function toggleSrcSelect(srcId) {
+  if (STATE.activeSrcIds.has(srcId)) {
+    STATE.activeSrcIds.delete(srcId);
+    // Clear any source columns belonging to this DF
+    STATE.activeSrcCols.forEach((v, k) => { if (v.srcId === srcId) STATE.activeSrcCols.delete(k); });
   } else {
-    STATE.srcId  = srcId;
-    STATE.srcCol = null;
+    STATE.activeSrcIds.add(srcId);
   }
   render();
 }
 
+// Source DFs that contribute to the currently selected target column (for auto-expand)
+function traceContribSrcIds() {
+  if (!STATE.activeTarget || !STATE.activeCol) return new Set();
+  const t = TGT_MAP[STATE.activeTarget];
+  if (!t || !t.traces) return new Set();
+  const trace = t.traces[STATE.activeCol];
+  if (!trace) return new Set();
+  return new Set((trace.sources || []).map(p => p.src_id).filter(Boolean));
+}
+
+function updateSrcPanelUI() {
+  const traceSrcs = traceContribSrcIds();  // auto-expand DFs that feed the selected column
+  DATA.sources.forEach(src => {
+    const hdr  = document.getElementById('srchdr_'  + src.id);
+    const cols = document.getElementById('srccols_' + src.id);
+    if (!hdr || !cols) return;
+    const selected  = STATE.activeSrcIds.has(src.id);
+    const traceOpen = traceSrcs.has(src.id);
+    hdr.classList.toggle('selected',  selected);
+    hdr.classList.toggle('expanded',  selected || traceOpen);
+    cols.classList.toggle('open',     selected || traceOpen);
+  });
+}
+
+// ── source column tracking ─────────────────────────────────────────────────
+// Multi-select: click to add, click again to remove. Columns from any source DF can coexist.
 function selectSrcCol(srcId, col) {
-  if (STATE.srcId === srcId && STATE.srcCol === col) {
-    STATE.srcId  = null;
-    STATE.srcCol = null;
+  const key = srcId + '|' + col;
+  if (STATE.activeSrcCols.has(key)) {
+    STATE.activeSrcCols.delete(key);
   } else {
-    STATE.srcId  = srcId;
-    STATE.srcCol = col;
+    STATE.activeSrcCols.set(key, {srcId, col});
+    STATE.activeSrcIds.add(srcId);   // ensure the DF accordion stays open
+    STATE.activeCol = null;          // clear target-column mode
   }
   render();
 }
 
 // ── target selection ───────────────────────────────────────────────────────
 function selectTarget(tid) {
-  STATE.tid = tid;
-  STATE.col = null;
-  document.getElementById('cols-panel').style.cssText = 'display:flex;flex-direction:column';
-  document.getElementById('col-search').value = '';
+  if (STATE.activeTarget === tid) {
+    // Deselect: close the detail view, hide columns panel
+    STATE.activeTarget = null;
+    STATE.activeCol    = null;
+    document.getElementById('cols-panel').style.cssText = 'display:none';
+    document.getElementById('col-search').value = '';
+  } else {
+    STATE.activeTarget = tid;
+    STATE.activeCol    = null;
+    document.getElementById('cols-panel').style.cssText = 'display:flex;flex-direction:column';
+    document.getElementById('col-search').value = '';
+  }
   render();
 }
 
 function selectColumn(col) {
-  STATE.col = col;
+  if (STATE.activeCol === col) {
+    STATE.activeCol = null;
+  } else {
+    STATE.activeCol = col;
+    STATE.activeSrcCols.clear();   // clear source-column mode when entering target-column trace
+  }
   render();
 }
 function filterCols(q) { renderColPanel(q); }
 
 // ── main render dispatcher ─────────────────────────────────────────────────
 function render() {
-  renderSourcePanel();
+  renderSourcePanelState();
   renderTargetList();
   renderColPanel(document.getElementById('col-search').value);
   renderMain();
 }
 
-function renderSourcePanel() {
-  document.querySelectorAll('.src-df-name').forEach(el => {
-    const sid = el.id.replace('sdf_', '');
-    el.classList.toggle('active', sid === STATE.srcId);
-  });
+function renderSourcePanelState() {
+  updateSrcPanelUI();
   document.querySelectorAll('.col-chip').forEach(el => {
-    el.classList.toggle('selected',
-      el.dataset.srcId === STATE.srcId && el.dataset.col === STATE.srcCol);
-    el.classList.remove('trace-source');  // cleared here, set by renderTrace
+    const key = el.dataset.srcId + '|' + el.dataset.col;
+    el.classList.toggle('tracked', STATE.activeSrcCols.has(key));
+    el.classList.remove('trace-source');
   });
 }
 
 function renderTargetList() {
-  const infl = currentInfluence();
+  const infl      = currentInfluence();
+  const isColMode = STATE.activeSrcCols.size > 0;
   document.querySelectorAll('.target-item').forEach(el => {
     const tid   = el.dataset.id;
     const badge = el.querySelector('.t-influence-badge');
-    el.classList.toggle('active', tid === STATE.tid);
+    const t     = TGT_MAP[tid];
+    el.classList.toggle('active', tid === STATE.activeTarget);
+
+    // highlight / dim the target item
     if (infl === null) {
       el.classList.remove('dim', 'influenced');
-      badge.textContent = '';
+    } else if (tid in infl) {
+      el.classList.remove('dim'); el.classList.add('influenced');
     } else {
-      const cols = infl[tid];
-      if (cols && cols.length) {
-        el.classList.remove('dim'); el.classList.add('influenced');
-        badge.textContent = cols.length + ' col' + (cols.length !== 1 ? 's' : '') + ' influenced';
-      } else {
-        el.classList.remove('influenced'); el.classList.add('dim');
-        badge.textContent = '';
-      }
+      el.classList.remove('influenced'); el.classList.add('dim');
     }
+
+    // Always render ALL source DF chips for this target.
+    // sel = currently selected (bright blue), unsel = not selected (dimmed).
+    // This never hides or removes a source — the user always sees what feeds the target.
+    const srcChips = (t ? t.source_dfs || [] : []).map(s => {
+      const cls  = STATE.activeSrcIds.has(s.id) ? 'sel' : 'unsel';
+      const name = esc(s.name || s.id.slice(0, 6));
+      return `<span class="t-src-chip ${cls}">${name}</span>`;
+    }).join('');
+
+    // In column mode: also show how many target cols the selected source cols influence
+    let colsBadge = '';
+    if (isColMode && infl && tid in infl) {
+      const n = (infl[tid] || []).length;
+      if (n > 0) colsBadge = `<span class="t-cols-badge">${n} col${n !== 1 ? 's' : ''}</span>`;
+    }
+
+    badge.innerHTML = srcChips + colsBadge;
   });
 }
 
 function renderColPanel(filter) {
-  if (!STATE.tid) return;
-  const t    = DATA.targets.find(x => x.id === STATE.tid);
+  if (!STATE.activeTarget) return;
+  const t    = TGT_MAP[STATE.activeTarget];
   const list = document.getElementById('col-list');
   list.innerHTML = '';
   if (!t) return;
   const infl = currentInfluence();
-  const influenced = infl ? new Set(infl[STATE.tid] || []) : new Set();
+  // Only highlight columns when this target is actually in the influence map
+  const targetInInfl = infl !== null && STATE.activeTarget in infl;
+  const influenced = targetInInfl ? new Set(infl[STATE.activeTarget] || []) : new Set();
   t.columns
     .filter(c => !filter || c.toLowerCase().includes(filter.toLowerCase()))
     .forEach(col => {
       const el = document.createElement('div');
       let cls = 'col-item';
-      if (col === STATE.col)            cls += ' active';
-      else if (influenced.has(col))     cls += ' influenced';
+      if (col === STATE.activeCol)       cls += ' active';
+      else if (influenced.has(col))      cls += ' influenced';
       el.className = cls; el.textContent = col; el.title = col;
       el.onclick = () => selectColumn(col);
       list.appendChild(el);
@@ -709,55 +955,91 @@ function renderColPanel(filter) {
 }
 
 function renderMain() {
-  if (!STATE.tid) {
+  if (!STATE.activeTarget) {
     document.getElementById('main').innerHTML =
-      '<p class="empty-msg">Select a target to explore its lineage</p>';
+      '<p class="empty-msg">Select a source column to track its influence, or a target to inspect it.</p>';
     return;
   }
-  if (!STATE.col) {
-    renderTargetOverview();
-  } else {
-    renderTrace();
-  }
+  STATE.activeCol ? renderTrace() : renderTargetOverview();
 }
 
 // ── target overview ────────────────────────────────────────────────────────
 function renderTargetOverview() {
-  const t      = DATA.targets.find(x => x.id === STATE.tid);
-  const traces = DATA.traces[STATE.tid] || {};
+  const t = TGT_MAP[STATE.activeTarget];
   if (!t) return;
 
-  // Classify columns by role
+  // Classify columns by role using embedded col_roles (no step traversal)
   const byRole = { created: [], modified: [], passthrough: [] };
   t.columns.forEach(col => {
-    const trace = traces[col];
-    if (!trace) { byRole.passthrough.push(col); return; }
-    const steps = trace.steps || [];
-    if (steps.some(s => s.role === 'created'))      byRole.created.push(col);
-    else if (steps.some(s => s.role === 'modified')) byRole.modified.push(col);
-    else                                              byRole.passthrough.push(col);
+    const role = (t.col_roles || {})[col] || 'passthrough';
+    byRole[role] = byRole[role] || [];
+    byRole[role].push(col);
   });
 
   const infl = currentInfluence();
-  const influenced = infl ? new Set(infl[STATE.tid] || []) : null;
+  // Only highlight chips when this target is actually in the influence map.
+  // If infl is non-null but this target isn't in it, no chip should glow —
+  // the green/grey colors are role colors, not influence indicators.
+  const targetInInfl = infl !== null && STATE.activeTarget in infl;
+  const influenced = targetInInfl ? new Set(infl[STATE.activeTarget] || []) : null;
 
   const chip = (col, role) => {
     const hl = influenced && influenced.has(col) ? ' hl' : '';
     return `<span class="t-ov-chip ${role}${hl}" onclick="selectColumn('${esc(col)}')">${esc(col)}</span>`;
   };
 
-  // Contributing source DataFrames
+  // Contributing source DataFrames — always shows ALL real sources for this target.
+  // Chips are highlighted (sel) if that source is currently selected in the left panel,
+  // dimmed (unsel) if it's a real source but not currently selected — so the user can
+  // clearly see "this target needs X, but you haven't selected X".
   const srcDFs = t.source_dfs || [];
   const srcDFsHTML = srcDFs.length
     ? `<div class="t-ov-section">Contributing Sources</div>
-       <div class="src-df-chips">${srcDFs.map(s =>
-         `<span class="src-df-chip" onclick="selectSrcDF('${s.id}')">${esc(s.name || s.id.slice(0,8))}</span>`
-       ).join('')}</div>`
+       <div class="src-df-chips">${srcDFs.map(s => {
+         const sname = s.name || (s.caller ? s.caller.file_short : s.id.slice(0,8));
+         const fqn   = s.caller && s.caller.fqn ? s.caller.fqn : '';
+         const cls   = STATE.activeSrcIds.has(s.id) ? 'sel' : 'unsel';
+         const tip   = fqn || sname;
+         return `<span class="src-df-chip ${cls}" title="${esc(tip)}" onclick="toggleSrcSelect('${esc(s.id)}')">${esc(sname)}${fqn ? '<span class=\\'src-df-chip-loc\\'>&nbsp;'+esc(fqn)+'</span>' : ''}</span>`;
+       }).join('')}</div>`
     : '';
 
-  const inflNote = influenced
-    ? `<div class="t-ov-section highlight">&#9650; Columns highlighted by source col &ldquo;${esc(STATE.srcCol)}&rdquo;</div>`
-    : '';
+  // Per-source-column breakdown: each selected source column gets its own row
+  // showing exactly which target columns it influences (or "no influence").
+  let inflSummaryHTML = '';
+  const isColMode = STATE.activeSrcCols.size > 0;
+  const isDFMode  = !isColMode && STATE.activeSrcIds.size > 0;
+
+  if (isColMode) {
+    const rows = [...STATE.activeSrcCols.values()].map(({srcId, col}) => {
+      const src     = SRC_MAP[srcId] || {};
+      const sname   = src.name || '';
+      const colInfl = ((src.influence || {})[col] || {})[STATE.activeTarget] || [];
+      const chips   = colInfl.length
+        ? colInfl.map(c =>
+            `<span class="infl-col-chip" onclick="selectColumn('${esc(c)}')">${esc(c)}</span>`
+          ).join('')
+        : `<span class="no-infl-note">no influence in this target</span>`;
+      return `<div class="src-col-attr-row">
+        <div class="src-col-attr-lhs">
+          <span class="src-col-name">${esc(col)}</span>
+          ${sname ? `<span class="src-col-df-name">\u2190 ${esc(sname)}</span>` : ''}
+          <span class="src-col-arrow">\u2192</span>
+        </div>
+        <div class="src-col-tgt-chips">${chips}</div>
+      </div>`;
+    }).join('');
+    inflSummaryHTML = `<div class="infl-summary">${rows}</div>`;
+  } else if (isDFMode && infl !== null && !(STATE.activeTarget in infl)) {
+    // Target not fed by the selected source DFs
+    const selNames = Array.from(STATE.activeSrcIds)
+      .map(sid => (SRC_MAP[sid] || {}).name || sid.slice(0, 6))
+      .join(', ');
+    inflSummaryHTML = `<div class="not-infl-banner">
+      \u26a0\ufe0f This target is <b>not fed by</b> the selected source(s): <b>${esc(selNames)}</b>.
+      The column colors below reflect each column\u2019s transformation role (created / passthrough), not source influence.
+    </div>`;
+  }
 
   const name = targetName(t);
   const loc  = t.caller ? t.caller.file_short + ':' + t.caller.line : '';
@@ -765,33 +1047,33 @@ function renderTargetOverview() {
   document.getElementById('main').innerHTML = `
     <div class="t-overview">
       <div class="t-ov-header">
-        <div style="min-width:0">
+        <div style="min-width:0;flex:1">
           <div class="t-ov-title">${esc(name)}</div>
           <div class="t-ov-sub">${esc(loc)}</div>
         </div>
         <div class="dl-bar">
-          <button class="dl-btn" onclick="dlTargetJSON('${esc(STATE.tid)}')">&#8595;&nbsp;JSON</button>
-          <button class="dl-btn" onclick="dlTargetHTML('${esc(STATE.tid)}')">&#8595;&nbsp;HTML</button>
+          <button class="dl-btn" onclick="dlTargetJSON('${esc(STATE.activeTarget)}')">&#8595;&nbsp;JSON</button>
+          <button class="dl-btn" onclick="dlTargetHTML('${esc(STATE.activeTarget)}')">&#8595;&nbsp;HTML</button>
         </div>
       </div>
       <div class="t-ov-stats">
         <span class="t-ov-stat"><b>${t.columns.length}</b> columns</span>
-        ${byRole.created.length   ? `<span class="t-ov-stat cr"><b>${byRole.created.length}</b> created</span>` : ''}
-        ${byRole.modified.length  ? `<span class="t-ov-stat mo"><b>${byRole.modified.length}</b> modified</span>` : ''}
-        ${byRole.passthrough.length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> passthrough</span>` : ''}
+        ${(byRole.created || []).length   ? `<span class="t-ov-stat cr"><b>${byRole.created.length}</b> created</span>` : ''}
+        ${(byRole.modified || []).length  ? `<span class="t-ov-stat mo"><b>${byRole.modified.length}</b> modified</span>` : ''}
+        ${(byRole.passthrough || []).length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> passthrough</span>` : ''}
       </div>
       ${srcDFsHTML}
-      ${inflNote}
-      ${byRole.created.length   ? '<div class="t-ov-section">Created</div><div class="t-ov-cols">'+byRole.created.map(c=>chip(c,'created')).join('')+'</div>' : ''}
-      ${byRole.modified.length  ? '<div class="t-ov-section">Modified</div><div class="t-ov-cols">'+byRole.modified.map(c=>chip(c,'modified')).join('')+'</div>' : ''}
-      ${byRole.passthrough.length ? '<div class="t-ov-section">Passthrough</div><div class="t-ov-cols">'+byRole.passthrough.map(c=>chip(c,'passthrough')).join('')+'</div>' : ''}
+      ${inflSummaryHTML}
+      ${(byRole.created || []).length   ? '<div class="t-ov-section">Created</div><div class="t-ov-cols">'+byRole.created.map(c=>chip(c,'created')).join('')+'</div>' : ''}
+      ${(byRole.modified || []).length  ? '<div class="t-ov-section">Modified</div><div class="t-ov-cols">'+byRole.modified.map(c=>chip(c,'modified')).join('')+'</div>' : ''}
+      ${(byRole.passthrough || []).length ? '<div class="t-ov-section">Passthrough</div><div class="t-ov-cols">'+byRole.passthrough.map(c=>chip(c,'passthrough')).join('')+'</div>' : ''}
     </div>`;
 }
 
 // ── column trace ───────────────────────────────────────────────────────────
 function renderTrace() {
-  const t     = DATA.targets.find(x => x.id === STATE.tid);
-  const trace = (DATA.traces[STATE.tid] || {})[STATE.col];
+  const t     = TGT_MAP[STATE.activeTarget];
+  const trace = t && t.traces ? t.traces[STATE.activeCol] : null;
   if (!trace) {
     document.getElementById('main').innerHTML =
       '<p class="empty-msg">No trace data for this column</p>';
@@ -800,17 +1082,36 @@ function renderTrace() {
 
   const steps   = [...(trace.steps || [])].reverse();
   const groups  = groupByContext(steps);
-  const srcCols = trace.sources || [];
+  const srcPairs = trace.sources || [];  // [{src_id, col, src_name}]
 
-  // Highlight source chips that contributed to this column
+  // Highlight source chips that directly contributed to this column
   document.querySelectorAll('.col-chip').forEach(el => {
-    el.classList.toggle('trace-source', srcCols.includes(el.dataset.col));
+    const contributed = srcPairs.some(p =>
+      (p.src_id ? p.src_id === el.dataset.srcId : true) && p.col === el.dataset.col
+    );
+    el.classList.toggle('trace-source', contributed);
   });
 
-  const srcChips = srcCols.map(s => {
-    const sid = COL_TO_SRC_ID[s] || '';
-    return `<span class="src-ref-chip" onclick="selectSrcCol('${esc(sid)}','${esc(s)}')" title="Track influence of ${esc(s)}">${esc(s)}</span>`;
+  const srcChips = srcPairs.map(p => {
+    const sid   = p.src_id || COL_TO_SRC_ID[p.col] || '';
+    const sname = p.src_name || (SRC_MAP[sid] || {}).name || '';
+    const label = sname ? p.col + ' \u2190 ' + sname : p.col;
+    return `<span class="src-ref-chip" onclick="selectSrcCol('${esc(sid)}','${esc(p.col)}')" title="Derived from ${esc(sname ? sname + '.' + p.col : p.col)}">${esc(label)}</span>`;
   }).join('');
+
+  // Fallback attribution when no column-level sources (e.g. count(*), count(1))
+  // Still show which source DF(s) the column was created from
+  const hasCreated = steps.some(s => s.role === 'created');
+  let attributionHTML = '';
+  if (srcChips) {
+    attributionHTML = '<div class="src-refs"><span class="src-refs-label">derived from</span>' + srcChips + '</div>';
+  } else if (hasCreated && t.source_dfs && t.source_dfs.length) {
+    const dfChips = t.source_dfs.map(s => {
+      const sname = s.name || (s.id || '').slice(0, 8);
+      return `<span class="src-ref-chip" onclick="toggleSrcSelect('${esc(s.id)}')">${esc(sname)}</span>`;
+    }).join('');
+    attributionHTML = `<div class="src-refs"><span class="src-refs-label">created from</span>${dfChips}<span style="color:#64748b;font-size:.62rem;margin-left:6px">(whole-dataset aggregate \u2014 no single column input)</span></div>`;
+  }
 
   const timelineHTML = groups.map((g, i) => renderGroup(g, i)).join('');
 
@@ -818,15 +1119,15 @@ function renderTrace() {
     <div class="trace-header">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">
         <div>
-          <div class="trace-col-name">${esc(STATE.col)}</div>
-          <div class="trace-target">in <span>${esc(t ? targetName(t) : STATE.tid)}</span></div>
+          <div class="trace-col-name">${esc(STATE.activeCol)}</div>
+          <div class="trace-target">in <span>${esc(t ? targetName(t) : STATE.activeTarget)}</span></div>
         </div>
         <div class="dl-bar">
-          <button class="dl-btn" onclick="dlColJSON('${esc(STATE.tid)}','${esc(STATE.col)}')">&#8595;&nbsp;JSON</button>
-          <button class="dl-btn" onclick="dlColHTML('${esc(STATE.tid)}','${esc(STATE.col)}')">&#8595;&nbsp;HTML</button>
+          <button class="dl-btn" onclick="dlColJSON('${esc(STATE.activeTarget)}','${esc(STATE.activeCol)}')">&#8595;&nbsp;JSON</button>
+          <button class="dl-btn" onclick="dlColHTML('${esc(STATE.activeTarget)}','${esc(STATE.activeCol)}')">&#8595;&nbsp;HTML</button>
         </div>
       </div>
-      ${srcChips ? '<div class="src-refs"><span class="src-refs-label">derived from</span>'+srcChips+'</div>' : ''}
+      ${attributionHTML}
     </div>
     <div class="timeline">${timelineHTML || '<p class="empty-msg">No steps</p>'}</div>`;
 }
@@ -835,7 +1136,6 @@ function renderTrace() {
 function groupByContext(steps) {
   const groups = []; let cur = null;
   steps.forEach(s => {
-    // source role always gets its own standalone "group" (no header)
     if (s.role === 'source') {
       if (cur) { groups.push(cur); cur = null; }
       groups.push({ standalone: true, step: s });
@@ -860,7 +1160,6 @@ function renderGroup(g, idx) {
   const caller = g.caller;
   const label = caller ? (caller.qualname || caller.func) + '()' : 'pipeline';
   const loc   = caller ? caller.file_short + ':' + caller.line : '';
-  const n = g.steps.length;
 
   const created     = g.steps.filter(s => s.role === 'created').length;
   const modified    = g.steps.filter(s => s.role === 'modified').length;
@@ -871,7 +1170,6 @@ function renderGroup(g, idx) {
   if (passthrough) parts.push(`<span style="color:#374151">${passthrough} pass</span>`);
   const rolesHTML = parts.join(' &middot; ');
 
-  // Default collapsed only if purely passthrough
   if (!(uid in GRP_COLLAPSED)) GRP_COLLAPSED[uid] = !g.hasSig;
   const collapsed = GRP_COLLAPSED[uid];
 
@@ -906,7 +1204,7 @@ function toggleGrp(uid) {
 function stepHTML(s) {
   const roleLabel = {source:'Source',created:'Created',modified:'Modified',passthrough:'Passthrough'}[s.role] || s.role;
   const op  = s.role === 'source' ? (s.name || 'source') : '.' + s.operation + '()';
-  const args = (s.args || []).join(',\n');
+  const args = (s.args || []).join(',\\n');
   const loc  = s.caller ? s.caller.file_short + ':' + s.caller.line : '';
   return `<div class="step ${s.role}">
     <div class="step-dot"></div>
@@ -921,83 +1219,75 @@ function stepHTML(s) {
 
 // ── downloads ──────────────────────────────────────────────────────────────
 function dlTargetJSON(tid) {
-  const t = DATA.targets.find(x => x.id === tid);
+  const t = TGT_MAP[tid];
   if (!t) return;
   const payload = {
-    meta:       Object.assign({}, DATA.meta, { scope: 'target', target: targetName(t) }),
-    target:     t,
-    source_dfs: t.source_dfs || [],
-    traces:     DATA.traces[tid] || {},
+    meta:    Object.assign({}, DATA.meta, { scope: 'target', target: targetName(t) }),
+    sources: (t.source_dfs || []).map(sf => SRC_MAP[sf.id]).filter(Boolean),
+    target:  t,
   };
   triggerDownload(JSON.stringify(payload, null, 2), 'application/json',
     safeName(targetName(t)) + '_lineage.json');
 }
 
 function dlTargetHTML(tid) {
-  const t = DATA.targets.find(x => x.id === tid);
+  const t = TGT_MAP[tid];
   if (!t) return;
-  const mini = buildSubsetData([tid]);
-  mini.meta = Object.assign({}, DATA.meta, { title: targetName(t), target_count: 1 });
+  const srcIds = new Set((t.source_dfs || []).map(s => s.id));
+  const sources = DATA.sources.filter(s => srcIds.has(s.id)).map(s => {
+    const influence = {};
+    Object.entries(s.influence || {}).forEach(([col, tgts]) => {
+      if (tgts[tid]) influence[col] = { [tid]: tgts[tid] };
+    });
+    return Object.assign({}, s, { influence });
+  });
+  const mini = {
+    meta:    Object.assign({}, DATA.meta, { title: targetName(t), source_count: sources.length, target_count: 1 }),
+    sources,
+    targets: [t],
+  };
   triggerDownload(injectData(mini), 'text/html',
     safeName(targetName(t)) + '_lineage.html');
 }
 
 function dlColJSON(tid, col) {
-  const t     = DATA.targets.find(x => x.id === tid);
-  const trace = (DATA.traces[tid] || {})[col];
+  const t = TGT_MAP[tid];
+  const trace = t && t.traces ? t.traces[col] : null;
   if (!t || !trace) return;
   const payload = {
     meta:   Object.assign({}, DATA.meta, { scope: 'column', target: targetName(t), column: col }),
     target: { id: t.id, label: t.label, caller: t.caller },
     column: col,
-    trace:  trace,
+    trace,
   };
   triggerDownload(JSON.stringify(payload, null, 2), 'application/json',
     safeName(targetName(t) + '_' + col) + '_trace.json');
 }
 
 function dlColHTML(tid, col) {
-  const t = DATA.targets.find(x => x.id === tid);
+  const t = TGT_MAP[tid];
   if (!t) return;
-  const tSlim = Object.assign({}, t, { columns: [col] });
+  const trace = t.traces ? t.traces[col] : null;
+  const tSlim = Object.assign({}, t, {
+    columns:   [col],
+    col_roles: { [col]: (t.col_roles || {})[col] || 'passthrough' },
+    traces:    { [col]: trace },
+  });
+  const srcIds = new Set((t.source_dfs || []).map(s => s.id));
+  const sources = DATA.sources.filter(s => srcIds.has(s.id)).map(s => {
+    const influence = {};
+    Object.entries(s.influence || {}).forEach(([sc, tgts]) => {
+      if (tgts[tid] && tgts[tid].includes(col)) influence[sc] = { [tid]: [col] };
+    });
+    return Object.assign({}, s, { influence });
+  });
   const mini = {
-    meta:                 Object.assign({}, DATA.meta, { title: targetName(t) + ' \u00b7 ' + col, target_count: 1 }),
-    source:               DATA.source,
-    all_sources:          t.source_dfs || DATA.all_sources,
-    all_source_influence: {},
-    source_influence:     {},
-    targets:              [tSlim],
-    traces:               { [tid]: { [col]: (DATA.traces[tid] || {})[col] } },
+    meta:    Object.assign({}, DATA.meta, { title: targetName(t) + ' \\u00b7 ' + col, source_count: sources.length, target_count: 1 }),
+    sources,
+    targets: [tSlim],
   };
   triggerDownload(injectData(mini), 'text/html',
     safeName(targetName(t) + '_' + col) + '_trace.html');
-}
-
-function buildSubsetData(tids) {
-  const targets = DATA.targets.filter(t => tids.includes(t.id));
-  const traces  = {};
-  const asi     = {};
-  tids.forEach(tid => { traces[tid] = DATA.traces[tid] || {}; });
-  (DATA.all_sources || []).forEach(src => {
-    asi[src.id] = {};
-    (src.columns || []).forEach(col => {
-      const f = {};
-      tids.forEach(tid => {
-        const c = ((DATA.all_source_influence[src.id] || {})[col] || {})[tid];
-        if (c) f[tid] = c;
-      });
-      if (Object.keys(f).length) asi[src.id][col] = f;
-    });
-  });
-  return {
-    meta:                 DATA.meta,
-    source:               DATA.source,
-    all_sources:          DATA.all_sources,
-    all_source_influence: asi,
-    source_influence:     {},
-    targets:              targets,
-    traces:               traces,
-  };
 }
 
 function injectData(filteredData) {

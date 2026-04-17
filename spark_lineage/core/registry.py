@@ -10,10 +10,10 @@ class LineageRegistry:
     # ── registration ──────────────────────────────────────────────────────────
 
     def register_root(self, df_id: str, name: Optional[str] = None,
-                      output_cols: list = None):
+                      output_cols: list = None, caller=None):
         node = LineageNode(
             id=df_id, operation=None, args_repr=[],
-            caller=None, parent_ids=[], name=name,
+            caller=caller, parent_ids=[], name=name,
         )
         if output_cols:
             node.output_cols = list(output_cols)

@@ -57,6 +57,9 @@ def build_event(
 
     data = _build_json(source_id, source_df, job_name)
 
+    # Primary source is the one with primary=True; fall back to first
+    primary = next((s for s in data["sources"] if s.get("primary")), data["sources"][0])
+
     return {
         "eventType": "COMPLETE",
         "eventTime": datetime.now(timezone.utc).isoformat(),
@@ -64,8 +67,8 @@ def build_event(
         "schemaURL": _RUN_SCHEMA,
         "run":  {"runId": run_id},
         "job":  {"namespace": job_namespace, "name": job_name},
-        "inputs":  _build_inputs(data["source"]),
-        "outputs": _build_outputs(data["targets"], data["traces"], data["source"]),
+        "inputs":  _build_inputs(primary),
+        "outputs": _build_outputs(data["targets"], primary),
     }
 
 
@@ -114,7 +117,7 @@ def _build_inputs(source: dict) -> list:
     }]
 
 
-def _build_outputs(targets: list, traces: dict, source: dict) -> list:
+def _build_outputs(targets: list, source: dict) -> list:
     source_name = source.get("name") or source["id"][:8]
     outputs = []
 
@@ -125,7 +128,7 @@ def _build_outputs(targets: list, traces: dict, source: dict) -> list:
         col_lineage_fields = {}
 
         for col in t["columns"]:
-            trace  = (traces.get(tid) or {}).get(col)
+            trace = (t.get("traces") or {}).get(col)
             if not trace:
                 continue
 

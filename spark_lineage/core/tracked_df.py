@@ -163,7 +163,8 @@ def _patched_getattribute(self, name: str):
                 out_cols = list(_BASE(self, "columns"))
             except Exception:
                 out_cols = []
-            _registry.register_root(dfi_id, name=None, output_cols=out_cols)
+            _registry.register_root(dfi_id, name=None, output_cols=out_cols,
+                                    caller=CallerInfo.capture(depth=3))
         else:
             return value
     # Tag DataFrameWriter with the source id so tracked_writer.py can intercept writes.

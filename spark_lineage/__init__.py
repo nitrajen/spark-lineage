@@ -15,12 +15,18 @@ from contextlib import contextmanager
 
 def track_df(df, name: str = None):
     """Explicitly mark a DataFrame as a lineage root."""
+    from .core.tracked_df import _BASE
+    from .core.node import CallerInfo
     df._dfi_id = uuid4().hex
     try:
         cols = list(df.columns)
     except Exception:
         cols = []
-    _registry.register_root(df._dfi_id, name=name, output_cols=cols)
+    try:
+        caller = CallerInfo.capture(depth=2)
+    except Exception:
+        caller = None
+    _registry.register_root(df._dfi_id, name=name, output_cols=cols, caller=caller)
     return df
 
 
