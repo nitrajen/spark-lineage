@@ -38,34 +38,101 @@ own analyzed query plan (`queryExecution().analyzed()`) — not string matching.
 - `build_ol_event(source_df, run_id, job_name, job_namespace)` — builds OpenLineage RunEvent dict.
 - `emit_openlineage(source_df, url, job_name, run_id, job_namespace)` — POSTs to collector.
 
-### Lineage report (`spark_lineage/report.py`)
-- Source-centric: one source DataFrame, N target (leaf) DataFrames.
-- `_build_col_source_map(path_nodes, source_id)` — walks all nodes topologically, resolves
-  column refs through intermediate columns to find ultimate source column attribution.
-  Multi-hop: `total → net_amount → {amount, discount}` works correctly.
-- `_build_col_trace(col, path_nodes, source_id, col_src_map)` — per-column vertical trace,
-  role classification: source / created / modified / passthrough.
-  Uses `node.column_refs` (plan-based) for role classification, NOT string matching.
-- `_compute_source_influence(source_cols, targets, traces)` — builds
-  `{source_col: {target_id: [influenced_target_cols]}}` for click-through filtering.
+### JSON data model (`spark_lineage/report.py` — `_build_json`)
+Self-contained hierarchical structure. Everything is precomputed — no JS traversal needed.
+```
+{
+  meta:    { title, generated_at, source_count, target_count }
+  sources: [
+    {
+      id, name, primary,           # primary=true for the source_df passed to save_report
+      caller,                      # { fqn: "module.Class.method:line", file_short, line, ... }
+      columns,                     # schema-order column list
+      influence: {                 # for each source column → which target cols it reaches
+        col: { target_id: [influenced_target_cols] }
+      }
+    }
+  ]
+  targets: [
+    {
+      id, label, name,
+      caller,                      # fqn of the function/line that produced this target
+      source_dfs,                  # [ {id, name, caller} ] — ALL ancestor source DFs
+      columns,                     # schema-order column list
+      col_roles: { col: "created"|"modified"|"passthrough" },
+      traces: {
+        col: {
+          sources: [ {src_id, col, src_name} ],   # ultimate source column attribution
+          steps:   [ {operation, role, args, caller, context_key} ]
+        }
+      }
+    }
+  ]
+}
+```
+Key design decisions:
+- `sources[].influence` uses `(src_id, col)` tuples — same-named columns in different source
+  DFs are never confused. `count(*)` and join-key-only sources have empty influence entries.
+- `targets[].source_dfs` is derived from actual ancestor nodes (not influence map), so it
+  correctly includes sources that contribute only via `count(*)` or join keys.
+- `_build_col_source_map` seeds with `{(node.id, col)}` tuples, propagates through transforms.
+- `_compute_source_influence` matches by exact `(src_id, col)` pair.
 
-### HTML report viewer
-- Two-pane: left sidebar (source columns, targets list, columns panel), right trace area.
-- Source column chips are **clickable** — clicking a source column dims non-influenced targets,
-  highlights influenced targets with badge, and marks influenced columns in blue in the column panel.
-- Target overview shown on target select (before column selected): qualname, file:line, column
-  count by role (created/modified/passthrough), source column attribution, clickable column chips.
-- Column trace: top = most recent step, bottom = creation/source (reverse chronological — "where
-  did this come from" mental model).
-- Passthrough steps shown by default, collapsible via toggle.
-- Passthrough step args shown (muted) so user can see what that step was doing.
+### HTML report viewer (`spark_lineage/report.py` — `_VIEWER_TEMPLATE`)
+Two-pane layout: left sidebar (sources accordion + targets list + columns panel), right main area.
+
+#### Left sidebar
+- **Sources accordion**: each source DF is a collapsible entry showing its column chips.
+  - Click header → toggle select (multi-select, `STATE.activeSrcIds` Set).
+  - Click column chip → toggle source column select (multi-select, `STATE.activeSrcCols` Map keyed `"srcId|col"`).
+  - FQN (`module.Class.method:line`) shown as sub-label under the name.
+- **Targets list**: always shows ALL source DF chips per target as `sel` (blue) / `unsel` (grey).
+  Selecting `orders`+`campaigns` and then deselecting `orders` → target keeps both chips,
+  `orders` chip turns grey. Never loses source info.
+  - Target dim/highlight uses AND logic: target must use ALL selected source DFs.
+- **Columns panel**: columns list at bottom, highlighted when fed by selected source.
+
+#### Interaction model (STATE)
+```javascript
+STATE = {
+  activeSrcIds:  Set,   // source DF multi-select — AND filter on targets
+  activeSrcCols: Map,   // source column multi-select: key="srcId|col", value={srcId,col}
+  activeTarget:  null,
+  activeCol:     null,
+}
+```
+- **DF mode** (`activeSrcCols` empty, `activeSrcIds` non-empty): AND filter — target highlighted
+  only if ALL selected DFs feed it.
+- **Column mode** (`activeSrcCols` non-empty): OR union — show which target cols any selected
+  source col influences. Influence summary shows per-source-column rows.
+- Selecting a target column clears `activeSrcCols` (bidirectional exclusivity).
+- Source DFs that contribute to the selected target column **auto-expand** so their chips
+  are visible and highlighted.
+
+#### Right main area
+- **Target overview** (target selected, no column): stats bar, Contributing Sources chips
+  (always shown, sel/unsel), per-source-column influence rows, Created/Modified/Passthrough chips.
+  - `not-infl-banner` shown when user opens a target not fed by selected source(s).
+  - Column chips only glow when the target IS in the influence map.
+- **Column trace** (column selected): "derived from" green chips at top (`col ← src_name`),
+  then reverse-chronological step timeline grouped by calling context.
+  - `count(*)` fallback: shows "created from [df] (whole-dataset aggregate — no single column input)".
+  - Source DFs auto-expand and contributing chips highlight when trace is shown.
 
 ### OpenLineage emitter (`spark_lineage/openlineage.py`)
-- `build_event(source_df, run_id, job_name, job_namespace)` — builds OpenLineage COMPLETE RunEvent.
-- `emit(source_df, url, job_name, ...)` — POSTs to `/api/v1/lineage` (Marquez/DataHub compatible).
-- Emits `columnLineage` facet per output column with `inputFields` (namespace/name/field) and
-  `transformations` (DIRECT/INDIRECT with subtype and description).
+- Uses `data["sources"]` (primary = one with `primary: True`).
+- `_build_outputs` reads `t["traces"][col]` for column lineage facet.
+- Emits `columnLineage` facet: `DIRECT`/`INDIRECT` with subtype and description.
 - Emits `schema` facet for inputs and outputs.
+
+## Known limitations / honest behavior
+- **`count(*)`**: no column-level source attribution (Spark plan has no column refs for `*`).
+  Displayed as "whole-dataset aggregate" with the source DF shown as context.
+- **Dead columns**: source columns not referenced in any downstream expression show
+  "no influence" with a "may be unused (dead column)" note — this is a real lineage finding.
+- **Join column attribution (P2)**: columns that flow through a join from a secondary source
+  are tracked, but `count(customer_id)` style aggs from a joined DF may not always attribute
+  back to the join source perfectly.
 
 ## What is NOT yet implemented (priority order)
 
@@ -75,35 +142,34 @@ own analyzed query plan (`queryExecution().analyzed()`) — not string matching.
 extract table/column refs, link back to tracked DataFrames via registered temp views.
 
 ### P1 — Better target labels
-Targets currently labeled as `.orderBy() · function_name()` (last operation + caller).
-Ideally the target label should be the variable name or dataset name the result is assigned to.
-Variable names are not available at runtime; best option is qualname (already showing in overview now)
-or explicit naming via `spl.track_df(result, "customer_summary")`.
+Targets labeled by `qualname()` of the function that produced them. Variable name is unavailable
+at runtime. Best alternative: explicit `spl.track_df(result, "customer_summary")`.
 
-### P2 — Join column attribution
-When `df1.join(df2, "key")`, columns from `df2` appear in the result. Currently these show no
-source attribution from the original source because `df2` is a separate lineage chain.
-Need: multi-root column source resolution.
+### P2 — Join column attribution (partial)
+Multi-source column resolution works but `count(*)` and aggregates that don't reference specific
+columns from a joined DF won't show that DF in influence. `source_dfs` (ancestor-based) is always
+correct; `influence` map may undercount for aggregate-heavy joins.
 
 ### P3 — OpenLineage transport for S3/HDFS
 `FileStore` writes to local disk. Cross-job lineage on cloud infra needs `S3Store` / `HDFSStore`.
-Short-term: use a shared NFS mount or serialize to object store outside the library.
 
 ### P4 — Kedro integration
-Kedro injects DataFrames via catalog hooks, not explicit reads. Best entry point:
-`after_dataset_loaded` hook calls `spl.track_df(data, dataset_name)`.
-No code changes needed — just documentation.
+Hook documented in `spark_lineage/integrations/kedro_hook.py`. Works as-is.
 
 ### P5 — `modified` role completeness
-`modified` role only fires when `node.column_refs` has the column AND refs differ from `{col}`.
-Ops that don't produce a Project/Aggregate plan (complex window functions, etc.) fall back to
-passthrough even if they modify the column. Acceptable false-negative (safer than false-positive).
+`modified` only fires when `node.column_refs` has the col AND refs differ from `{col}`.
+Complex window functions fall back to passthrough. Acceptable false-negative.
+
+### P6 — Per-source breakdown in target overview
+When a target has multiple contributing source DFs, the right pane overview currently shows
+flat Created/Modified/Passthrough sections. Planned: group by source DF, showing which columns
+each source contributes with their roles and source column attribution.
 
 ## Key files
 ```
 spark_lineage/
   __init__.py           public API
-  report.py             JSON builder + HTML template
+  report.py             JSON builder + HTML template (~1300 lines)
   openlineage.py        OpenLineage emitter
   core/
     tracked_df.py       DataFrame + GroupedData patches
@@ -112,8 +178,19 @@ spark_lineage/
     registry.py         in-memory lineage graph
     node.py             LineageNode + CallerInfo dataclasses
     store.py            MemoryStore + FileStore
+  integrations/
+    kedro_hook.py       Kedro after_dataset_loaded + after_pipeline_run hooks
 
-test_comprehensive.py   large test pipeline (SalesAnalyticsPipeline, 4 branches)
+test_comprehensive.py   SalesAnalyticsPipeline — 4 sources (orders/campaigns/customers/products),
+                        4 targets (monthly_channel_trends, product_performance,
+                        channel_campaign_efficiency, customer_lifetime_value)
 sales_lineage.html      generated report (gitignored)
 sales_lineage.json      generated data (gitignored)
+```
+
+## Running the test
+```bash
+python test_comprehensive.py
+# produces sales_lineage.html + sales_lineage.json
+open sales_lineage.html
 ```
