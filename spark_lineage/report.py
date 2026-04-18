@@ -460,10 +460,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .src-df-header:hover{background:#1a2235}
 .src-df-chevron{font-size:.6rem;color:#374151;width:12px;flex-shrink:0;transition:transform .15s}
 .src-df-header.expanded .src-df-chevron{transform:rotate(90deg)}
-.src-df-label{font-size:.73rem;font-weight:700;color:#7dd3fc;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.src-df-label{font-size:.72rem;font-weight:600;color:#7dd3fc;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .src-df-header.secondary .src-df-label{color:#94a3b8}
 .src-df-loc{font-size:.6rem;color:#374151;white-space:nowrap}
-.src-df-fqn{font-size:.62rem;color:#64748b;font-family:'SF Mono',Consolas,monospace;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-right:4px}
+/* FQN is the stable identifier — shown prominently so engineers can locate the DF in code */
+.src-df-fqn{font-size:.63rem;color:#7dd3fc;font-family:'SF Mono',Consolas,monospace;font-weight:400;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;padding-right:4px;opacity:.7}
 .src-df-header.selected{background:#0c1f38;border-left:2px solid #38bdf8}
 .src-df-header.selected .src-df-label{color:#7dd3fc}
 .src-cols-wrap{padding:4px 14px 8px 30px;display:none;flex-wrap:wrap;gap:3px}
@@ -480,7 +481,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .target-item.active{background:#1e2d40;border-left-color:#38bdf8}
 .t-label{font-size:.75rem;color:#94a3b8;font-weight:500;word-break:break-word;line-height:1.4}
 .t-sub{font-size:.62rem;color:#374151;margin-top:1px}
-.target-item.dim{opacity:.22}
+.target-item.dim{opacity:.4}
 .target-item.influenced .t-label{color:#7dd3fc}
 /* Source DF chips — always shown under every target.
    sel = currently selected source (bright), unsel = real source but not selected (dimmed) */
@@ -516,12 +517,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-ov-section{font-size:.6rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;margin-top:18px}
 .t-ov-section.highlight{color:#38bdf8;text-transform:none;font-size:.65rem;font-weight:400;letter-spacing:0}
 .t-ov-cols{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
+/* per-source-df breakdown */
+.src-section{margin:10px 0 6px 0}
+.src-section-hdr{display:flex;align-items:center;gap:8px;padding:5px 0 5px 0;border-bottom:1px solid #1a2235;margin-bottom:8px}
+.src-section-name{font-size:.68rem;font-weight:700;padding:2px 10px;border-radius:9px;cursor:pointer;transition:opacity .12s}
+.src-section-name:hover{opacity:.8}
+.src-section-name.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
+.src-section-name.unsel{color:#94a3b8;background:#161b27;border:1px solid #2d3f55}
+.src-section-fqn{font-size:.58rem;color:#374151;font-family:'SF Mono',Consolas,monospace}
+.src-col-group{margin-bottom:8px}
+.src-col-group-label{font-size:.57rem;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
+.src-col-row-item{display:flex;align-items:center;flex-wrap:wrap;gap:3px;margin-bottom:3px}
+.src-attr-arrow{font-size:.6rem;color:#1e2d40;margin:0 1px}
+.src-attr-chip{font-size:.58rem;color:#64748b;background:#0d1117;border:1px solid #1e2d40;padding:1px 5px;border-radius:5px;white-space:nowrap}
+.no-attr-note{font-size:.58rem;color:#374151;font-style:italic;margin-left:4px}
 .t-ov-chip{font-size:.65rem;padding:2px 9px;border-radius:9px;white-space:nowrap;cursor:pointer;transition:opacity .15s}
 .t-ov-chip:hover{opacity:.75}
 .t-ov-chip.created{background:#0c2340;color:#38bdf8;border:1px solid #1d4ed8}
 .t-ov-chip.modified{background:#431407;color:#fb923c;border:1px solid #c2410c}
-.t-ov-chip.passthrough{background:#1a2235;color:#4b5563;border:1px solid #21283a}
-.t-ov-chip.hl{box-shadow:0 0 0 2px #38bdf8}
+.t-ov-chip.passthrough{background:#1a2235;color:#94a3b8;border:1px solid #2d3f55}
+.t-ov-chip.hl{outline:2px solid #38bdf8;outline-offset:1px}
 .src-df-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:4px}
 .src-df-chip{display:inline-block;font-size:.65rem;padding:2px 10px;border-radius:9px;cursor:default;white-space:nowrap}
 .src-df-chip.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
@@ -552,6 +567,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 
 /* trace */
 .trace-header{margin-bottom:20px}
+.back-btn{background:none;border:none;color:#4b5563;font-size:.65rem;cursor:pointer;padding:0;margin-bottom:6px;display:block;transition:color .12s}
+.back-btn:hover{color:#7dd3fc}
 .trace-col-name{font-size:1.25rem;font-weight:700;color:#e2e8f0;margin-bottom:3px}
 .trace-target{font-size:.7rem;color:#374151;margin-bottom:8px}
 .trace-target span{color:#64748b}
@@ -870,7 +887,8 @@ function selectColumn(col) {
     STATE.activeCol = null;
   } else {
     STATE.activeCol = col;
-    STATE.activeSrcCols.clear();   // clear source-column mode when entering target-column trace
+    // Do NOT clear activeSrcCols — keep source column context so chips stay highlighted
+    // alongside the trace. The trace auto-expands contributing source DFs independently.
   }
   render();
 }
@@ -963,46 +981,99 @@ function renderMain() {
   STATE.activeCol ? renderTrace() : renderTargetOverview();
 }
 
+// ── per-source breakdown helper ────────────────────────────────────────────
+// Groups every target column under the source DF(s) it comes from.
+// A column appears under EACH source DF that contributes to it (multi-source is fine).
+// Columns with no column-level attribution (count(*) etc.) go in an "Aggregated" section.
+function buildSrcSections(t, influenced, chip) {
+  const srcDFs = t.source_dfs || [];
+  const attribToAny = new Set();
+
+  const sections = srcDFs.map(src => {
+    const cls   = STATE.activeSrcIds.has(src.id) ? 'sel' : 'unsel';
+    const sname = src.name || src.id.slice(0, 6);
+    const fqn   = src.caller && src.caller.fqn ? src.caller.fqn : '';
+
+    // Columns that have at least one source attribution from this source DF
+    const attrCols = t.columns.filter(col => {
+      const trace = (t.traces || {})[col];
+      return trace && (trace.sources || []).some(p => p.src_id === src.id);
+    });
+    attrCols.forEach(c => attribToAny.add(c));
+    if (!attrCols.length) return '';
+
+    const bySrcRole = {created: [], modified: [], passthrough: []};
+    attrCols.forEach(col => {
+      const role = (t.col_roles || {})[col] || 'passthrough';
+      (bySrcRole[role] = bySrcRole[role] || []).push(col);
+    });
+
+    const roleGroups = ['created', 'modified', 'passthrough'].map(role => {
+      const cols = bySrcRole[role] || [];
+      if (!cols.length) return '';
+      const label = {created: 'Created', modified: 'Modified', passthrough: 'Passthrough'}[role];
+      const rows = cols.map(col => {
+        // Which source columns from THIS source DF feed into col?
+        const trace = (t.traces || {})[col] || {};
+        const srcColChips = (trace.sources || [])
+          .filter(p => p.src_id === src.id)
+          .map(p => `<span class="src-attr-chip">${esc(p.col)}</span>`)
+          .join('');
+        const attr = srcColChips
+          ? `<span class="src-attr-arrow">\u2190</span>${srcColChips}`
+          : '';
+        return `<div class="src-col-row-item">${chip(col, role)}${attr}</div>`;
+      }).join('');
+      return `<div class="src-col-group"><div class="src-col-group-label">${label}</div>${rows}</div>`;
+    }).join('');
+
+    return `<div class="src-section">
+      <div class="src-section-hdr">
+        <span class="src-section-name ${cls}" onclick="toggleSrcSelect('${esc(src.id)}')">${esc(sname)}</span>
+        ${fqn ? `<span class="src-section-fqn">${esc(fqn)}</span>` : ''}
+      </div>
+      ${roleGroups}
+    </div>`;
+  }).join('');
+
+  // Columns with no column-level attribution (e.g. count(*)) go in a separate section
+  const unattrib = t.columns.filter(c => !attribToAny.has(c));
+  const aggSection = unattrib.length ? `<div class="src-section">
+    <div class="src-section-hdr">
+      <span class="src-section-fqn">\u2014 Whole-dataset aggregates (no single column input)</span>
+    </div>
+    <div class="src-col-group">
+      ${unattrib.map(col => {
+        const role = (t.col_roles || {})[col] || 'created';
+        return `<div class="src-col-row-item">${chip(col, role)}<span class="no-attr-note">e.g. count(*)</span></div>`;
+      }).join('')}
+    </div>
+  </div>` : '';
+
+  return sections + aggSection;
+}
+
 // ── target overview ────────────────────────────────────────────────────────
 function renderTargetOverview() {
   const t = TGT_MAP[STATE.activeTarget];
   if (!t) return;
 
-  // Classify columns by role using embedded col_roles (no step traversal)
+  const infl = currentInfluence();
+  // Only highlight chips when this target is actually in the influence map.
+  const targetInInfl = infl !== null && STATE.activeTarget in infl;
+  const influenced = targetInInfl ? new Set(infl[STATE.activeTarget] || []) : null;
+
+  // Count by role for stats bar
   const byRole = { created: [], modified: [], passthrough: [] };
   t.columns.forEach(col => {
     const role = (t.col_roles || {})[col] || 'passthrough';
-    byRole[role] = byRole[role] || [];
-    byRole[role].push(col);
+    (byRole[role] = byRole[role] || []).push(col);
   });
-
-  const infl = currentInfluence();
-  // Only highlight chips when this target is actually in the influence map.
-  // If infl is non-null but this target isn't in it, no chip should glow —
-  // the green/grey colors are role colors, not influence indicators.
-  const targetInInfl = infl !== null && STATE.activeTarget in infl;
-  const influenced = targetInInfl ? new Set(infl[STATE.activeTarget] || []) : null;
 
   const chip = (col, role) => {
     const hl = influenced && influenced.has(col) ? ' hl' : '';
     return `<span class="t-ov-chip ${role}${hl}" onclick="selectColumn('${esc(col)}')">${esc(col)}</span>`;
   };
-
-  // Contributing source DataFrames — always shows ALL real sources for this target.
-  // Chips are highlighted (sel) if that source is currently selected in the left panel,
-  // dimmed (unsel) if it's a real source but not currently selected — so the user can
-  // clearly see "this target needs X, but you haven't selected X".
-  const srcDFs = t.source_dfs || [];
-  const srcDFsHTML = srcDFs.length
-    ? `<div class="t-ov-section">Contributing Sources</div>
-       <div class="src-df-chips">${srcDFs.map(s => {
-         const sname = s.name || (s.caller ? s.caller.file_short : s.id.slice(0,8));
-         const fqn   = s.caller && s.caller.fqn ? s.caller.fqn : '';
-         const cls   = STATE.activeSrcIds.has(s.id) ? 'sel' : 'unsel';
-         const tip   = fqn || sname;
-         return `<span class="src-df-chip ${cls}" title="${esc(tip)}" onclick="toggleSrcSelect('${esc(s.id)}')">${esc(sname)}${fqn ? '<span class=\\'src-df-chip-loc\\'>&nbsp;'+esc(fqn)+'</span>' : ''}</span>`;
-       }).join('')}</div>`
-    : '';
 
   // Per-source-column breakdown: each selected source column gets its own row
   // showing exactly which target columns it influences (or "no influence").
@@ -1062,11 +1133,8 @@ function renderTargetOverview() {
         ${(byRole.modified || []).length  ? `<span class="t-ov-stat mo"><b>${byRole.modified.length}</b> modified</span>` : ''}
         ${(byRole.passthrough || []).length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> passthrough</span>` : ''}
       </div>
-      ${srcDFsHTML}
       ${inflSummaryHTML}
-      ${(byRole.created || []).length   ? '<div class="t-ov-section">Created</div><div class="t-ov-cols">'+byRole.created.map(c=>chip(c,'created')).join('')+'</div>' : ''}
-      ${(byRole.modified || []).length  ? '<div class="t-ov-section">Modified</div><div class="t-ov-cols">'+byRole.modified.map(c=>chip(c,'modified')).join('')+'</div>' : ''}
-      ${(byRole.passthrough || []).length ? '<div class="t-ov-section">Passthrough</div><div class="t-ov-cols">'+byRole.passthrough.map(c=>chip(c,'passthrough')).join('')+'</div>' : ''}
+      ${buildSrcSections(t, influenced, chip)}
     </div>`;
 }
 
@@ -1118,9 +1186,9 @@ function renderTrace() {
   document.getElementById('main').innerHTML = `
     <div class="trace-header">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">
-        <div>
+        <div style="min-width:0;flex:1">
+          <button class="back-btn" onclick="selectColumn('${esc(STATE.activeCol)}')">&#8592; ${esc(t ? targetName(t) : STATE.activeTarget)}</button>
           <div class="trace-col-name">${esc(STATE.activeCol)}</div>
-          <div class="trace-target">in <span>${esc(t ? targetName(t) : STATE.activeTarget)}</span></div>
         </div>
         <div class="dl-bar">
           <button class="dl-btn" onclick="dlColJSON('${esc(STATE.activeTarget)}','${esc(STATE.activeCol)}')">&#8595;&nbsp;JSON</button>
