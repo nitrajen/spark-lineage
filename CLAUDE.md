@@ -101,13 +101,37 @@ STATE = {
   activeCol:     null,
 }
 ```
-- **DF mode** (`activeSrcCols` empty, `activeSrcIds` non-empty): AND filter — target highlighted
-  only if ALL selected DFs feed it.
-- **Column mode** (`activeSrcCols` non-empty): OR union — show which target cols any selected
-  source col influences. Influence summary shows per-source-column rows.
-- Selecting a target column clears `activeSrcCols` (bidirectional exclusivity).
-- Source DFs that contribute to the selected target column **auto-expand** so their chips
-  are visible and highlighted.
+
+**Startup**: nothing is auto-selected. Both panels are built but STATE is all-null/empty.
+
+**Selection cascade — complete model**
+
+| Level | Element | Action | Result |
+|-------|---------|--------|--------|
+| 1 | Source DF header | click | `toggleSrcSelect`: toggle in `activeSrcIds`; deselecting also clears that DF's source columns from `activeSrcCols` |
+| 2 | Source column chip | click | `selectSrcCol`: toggle in `activeSrcCols`; selecting also adds parent DF to `activeSrcIds` and clears `activeCol` |
+| 3 | Target item | click | `selectTarget`: toggle `activeTarget`; deselecting also clears `activeCol` and hides cols-panel |
+| 4 | Target column | click | `selectColumn`: toggle `activeCol`; deselecting returns to target overview. Back button does the same. |
+
+**Key cascade rules**:
+1. Deselect source DF → also clears its source columns (but NOT target/column selections)
+2. Select source column → ensures parent DF expands (adds to `activeSrcIds`), clears `activeCol`
+3. Deselect target → clears column too (col has no context without a target)
+4. Deselect column → returns to target overview (target stays selected)
+5. Selecting a target column does **NOT** clear `activeSrcCols` — source column context
+   is preserved alongside the trace view
+
+**Mode switching (automatic, no toggle)**:
+- **DF mode**: `activeSrcCols.size === 0` — AND intersection over `activeSrcIds` determines
+  which targets highlight. Target highlighted only if ALL selected DFs feed it.
+- **Column mode**: `activeSrcCols.size > 0` — OR union over selected source columns.
+  Badge shows `N cols` count per target.
+- Exits column mode by deselecting all source columns.
+
+**Source accordion expansion logic** (`updateSrcPanelUI`):
+- Selected DF (`activeSrcIds.has(id)`): always expanded, `selected` + `expanded` classes.
+- Unselected DF: collapsed, **unless** a trace is active and that DF contributes to the
+  selected column's trace → auto-expands via `traceContribSrcIds()` without modifying STATE.
 
 #### Right main area
 - **Target overview** (target selected, no column): stats bar, Contributing Sources chips
@@ -160,10 +184,10 @@ Hook documented in `spark_lineage/integrations/kedro_hook.py`. Works as-is.
 `modified` only fires when `node.column_refs` has the col AND refs differ from `{col}`.
 Complex window functions fall back to passthrough. Acceptable false-negative.
 
-### P6 — Per-source breakdown in target overview
-When a target has multiple contributing source DFs, the right pane overview currently shows
-flat Created/Modified/Passthrough sections. Planned: group by source DF, showing which columns
-each source contributes with their roles and source column attribution.
+### P6 — Per-source breakdown in target overview ✓ DONE
+Right pane overview groups columns by contributing source DF (`buildSrcSections`), with role
+subgroups (Created/Modified/Passthrough) and source column attribution arrows per group.
+Columns with no column-level attribution (count(*) etc.) appear in "Whole-dataset aggregates" section.
 
 ## Key files
 ```
