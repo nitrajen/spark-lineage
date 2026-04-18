@@ -488,7 +488,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-influence-badge{display:flex;flex-wrap:wrap;gap:2px;margin-top:3px}
 .t-src-chip{font-size:.55rem;padding:1px 6px;border-radius:7px;white-space:nowrap}
 .t-src-chip.sel{color:#38bdf8;background:#0c2340;border:1px solid #1d4ed8}
-.t-src-chip.unsel{color:#374151;background:transparent;border:1px solid #1e2d40}
+.t-src-chip.unsel{color:#6b7280;background:transparent;border:1px solid #374151}
 .t-cols-badge{font-size:.55rem;color:#34d399;background:#052e16;border:1px solid #166534;border-radius:7px;padding:1px 5px;margin-left:2px}
 
 /* columns panel */
@@ -509,12 +509,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-overview{max-width:860px}
 .t-ov-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;gap:14px}
 .t-ov-title{font-size:1.15rem;font-weight:700;color:#e2e8f0;margin-bottom:3px;word-break:break-word;line-height:1.4}
-.t-ov-sub{font-size:.72rem;color:#4b5563}
+.t-ov-sub{font-size:.72rem;color:#64748b}
 .t-ov-stats{display:flex;flex-wrap:wrap;gap:0;margin-bottom:16px}
-.t-ov-stat{display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:.68rem;color:#4b5563}
+.t-ov-stat{display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:.68rem;color:#64748b}
 .t-ov-stat b{color:#94a3b8}
 .t-ov-stat.cr b{color:#38bdf8}.t-ov-stat.mo b{color:#fb923c}
-.t-ov-section{font-size:.6rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;margin-top:18px}
+.t-ov-section{font-size:.6rem;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;margin-top:18px}
 .t-ov-section.highlight{color:#38bdf8;text-transform:none;font-size:.65rem;font-weight:400;letter-spacing:0}
 .t-ov-cols{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
 /* per-source-df breakdown */
@@ -524,24 +524,28 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .src-section-name:hover{opacity:.8}
 .src-section-name.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
 .src-section-name.unsel{color:#94a3b8;background:#161b27;border:1px solid #2d3f55}
-.src-section-fqn{font-size:.58rem;color:#374151;font-family:'SF Mono',Consolas,monospace}
+.src-section-fqn{font-size:.58rem;color:#4b5563;font-family:'SF Mono',Consolas,monospace}
 .src-col-group{margin-bottom:8px}
-.src-col-group-label{font-size:.57rem;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
+.src-col-group-label{font-size:.57rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
 .src-col-row-item{display:flex;align-items:center;flex-wrap:wrap;gap:3px;margin-bottom:3px}
-.src-attr-arrow{font-size:.6rem;color:#1e2d40;margin:0 1px}
-.src-attr-chip{font-size:.58rem;color:#64748b;background:#0d1117;border:1px solid #1e2d40;padding:1px 5px;border-radius:5px;white-space:nowrap}
-.no-attr-note{font-size:.58rem;color:#374151;font-style:italic;margin-left:4px}
+.src-attr-arrow{font-size:.6rem;color:#374151;margin:0 1px}
+.src-attr-chip{font-size:.58rem;color:#64748b;background:#0d1117;border:1px solid #374151;padding:1px 5px;border-radius:5px;white-space:nowrap}
+.no-attr-note{font-size:.58rem;color:#4b5563;font-style:italic;margin-left:4px}
 .t-ov-chip{font-size:.65rem;padding:2px 9px;border-radius:9px;white-space:nowrap;cursor:pointer;transition:opacity .15s}
 .t-ov-chip:hover{opacity:.75}
 .t-ov-chip.created{background:#0c2340;color:#38bdf8;border:1px solid #1d4ed8}
 .t-ov-chip.modified{background:#431407;color:#fb923c;border:1px solid #c2410c}
 .t-ov-chip.passthrough{background:#1a2235;color:#94a3b8;border:1px solid #2d3f55}
 .t-ov-chip.hl{outline:2px solid #38bdf8;outline-offset:1px}
+.t-ov-desc{font-size:.65rem;color:#4b5563;margin:-4px 0 10px 0;line-height:1.5}
+.src-summary-list{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
+.src-summary-entry{display:flex;align-items:center;gap:6px}
+.src-df-chip-static{display:inline-block;font-size:.65rem;padding:2px 10px;border-radius:9px;color:#94a3b8;background:#161b27;border:1px solid #2d3f55;white-space:nowrap}
 .src-df-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:4px}
 .src-df-chip{display:inline-block;font-size:.65rem;padding:2px 10px;border-radius:9px;cursor:default;white-space:nowrap}
 .src-df-chip.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
-.src-df-chip.unsel{color:#4b5563;background:#111827;border:1px solid #1e2d40}
-.src-df-chip-loc{font-size:.58rem;color:#374151;margin-left:3px}
+.src-df-chip.unsel{color:#6b7280;background:#111827;border:1px solid #374151}
+.src-df-chip-loc{font-size:.58rem;color:#4b5563;margin-left:3px}
 
 /* infl summary */
 .infl-summary{margin-top:4px;margin-bottom:6px;padding:8px 10px;background:#0c1f38;border:1px solid #1d4ed8;border-radius:6px;font-size:.65rem;color:#7dd3fc}
@@ -1134,6 +1138,20 @@ function renderTargetOverview() {
         ${(byRole.passthrough || []).length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> passthrough</span>` : ''}
       </div>
       ${inflSummaryHTML}
+      <div class="t-ov-section" style="margin-top:12px">Source DataFrames</div>
+      <p class="t-ov-desc">Data in this target originates from the following DataFrames. The identifier shown is the fully-qualified function and line where the DataFrame was first tracked.</p>
+      <div class="src-summary-list">
+        ${(t.source_dfs || []).map(s => {
+          const name = s.name || s.id.slice(0, 6);
+          const fqn  = s.caller ? (s.caller.fqn || (s.caller.file_short + ':' + s.caller.line)) : '';
+          return `<div class="src-summary-entry">
+            <span class="src-df-chip-static">${esc(name)}</span>
+            ${fqn ? `<span class="src-df-chip-loc">${esc(fqn)}</span>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
+      <div class="t-ov-section" style="margin-top:22px">Target DataFrame Columns</div>
+      <p class="t-ov-desc">Every column in this target, grouped by which source DataFrame it originates from. Arrows (←) show the exact source column(s) each was derived from.</p>
       ${buildSrcSections(t, influenced, chip)}
     </div>`;
 }
