@@ -488,7 +488,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-influence-badge{display:flex;flex-wrap:wrap;gap:2px;margin-top:3px}
 .t-src-chip{font-size:.55rem;padding:1px 6px;border-radius:7px;white-space:nowrap}
 .t-src-chip.sel{color:#38bdf8;background:#0c2340;border:1px solid #1d4ed8}
-.t-src-chip.unsel{color:#6b7280;background:transparent;border:1px solid #374151}
+.t-src-chip.unsel{color:#94a3b8;background:#1a2235;border:1px solid #374151}
 .t-cols-badge{font-size:.55rem;color:#34d399;background:#052e16;border:1px solid #166534;border-radius:7px;padding:1px 5px;margin-left:2px}
 
 /* columns panel */
@@ -520,10 +520,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* per-source-df breakdown */
 .src-section{margin:10px 0 6px 0}
 .src-section-hdr{display:flex;align-items:center;gap:8px;padding:5px 0 5px 0;border-bottom:1px solid #1a2235;margin-bottom:8px}
-.src-section-name{font-size:.68rem;font-weight:700;padding:2px 10px;border-radius:9px;cursor:pointer;transition:opacity .12s}
-.src-section-name:hover{opacity:.8}
-.src-section-name.sel{color:#7dd3fc;background:#0c2340;border:1px solid #38bdf8}
-.src-section-name.unsel{color:#94a3b8;background:#161b27;border:1px solid #2d3f55}
+.src-section-name{font-size:.68rem;font-weight:700;padding:2px 10px;border-radius:9px;color:#7dd3fc;background:#0c2340;border:1px solid #1e3a5f}
 .src-section-fqn{font-size:.58rem;color:#4b5563;font-family:'SF Mono',Consolas,monospace}
 .src-col-group{margin-bottom:8px}
 .src-col-group-label{font-size:.57rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
@@ -533,10 +530,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .no-attr-note{font-size:.58rem;color:#4b5563;font-style:italic;margin-left:4px}
 .t-ov-chip{font-size:.65rem;padding:2px 9px;border-radius:9px;white-space:nowrap;cursor:pointer;transition:opacity .15s}
 .t-ov-chip:hover{opacity:.75}
-.t-ov-chip.created{background:#0c2340;color:#38bdf8;border:1px solid #1d4ed8}
-.t-ov-chip.modified{background:#431407;color:#fb923c;border:1px solid #c2410c}
-.t-ov-chip.passthrough{background:#1a2235;color:#94a3b8;border:1px solid #2d3f55}
-.t-ov-chip.hl{outline:2px solid #38bdf8;outline-offset:1px}
+.t-ov-chip.created{background:#0d1729;color:#93c5fd;border:1px solid #1e3a5f}
+.t-ov-chip.modified{background:#1c0f07;color:#fdba74;border:1px solid #7c2d12}
+.t-ov-chip.passthrough{background:transparent;color:#6b7280;border:1px solid #374151}
 .t-ov-desc{font-size:.65rem;color:#4b5563;margin:-4px 0 10px 0;line-height:1.5}
 .src-summary-list{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
 .src-summary-entry{display:flex;align-items:center;gap:6px}
@@ -1033,7 +1029,7 @@ function buildSrcSections(t, influenced, chip) {
 
     return `<div class="src-section">
       <div class="src-section-hdr">
-        <span class="src-section-name ${cls}" onclick="toggleSrcSelect('${esc(src.id)}')">${esc(sname)}</span>
+        <span class="src-section-name">${esc(sname)}</span>
         ${fqn ? `<span class="src-section-fqn">${esc(fqn)}</span>` : ''}
       </div>
       ${roleGroups}
@@ -1075,8 +1071,7 @@ function renderTargetOverview() {
   });
 
   const chip = (col, role) => {
-    const hl = influenced && influenced.has(col) ? ' hl' : '';
-    return `<span class="t-ov-chip ${role}${hl}" onclick="selectColumn('${esc(col)}')">${esc(col)}</span>`;
+    return `<span class="t-ov-chip ${role}" onclick="selectColumn('${esc(col)}')">${esc(col)}</span>`;
   };
 
   // Per-source-column breakdown: each selected source column gets its own row
