@@ -573,10 +573,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .trace-col-name{font-size:1.25rem;font-weight:700;color:#e2e8f0;margin-bottom:3px}
 .trace-target{font-size:.7rem;color:#374151;margin-bottom:8px}
 .trace-target span{color:#64748b}
-.src-refs{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:8px}
-.src-refs-label{font-size:.62rem;color:#374151;margin-right:4px}
-.src-ref-chip{font-size:.65rem;color:#34d399;background:#052e16;padding:2px 8px;border-radius:9px;border:1px solid #166534;cursor:pointer;transition:all .15s}
-.src-ref-chip:hover{opacity:.8}
+/* trace attribution block */
+.trace-attribution{margin-top:14px;padding:12px 14px;background:#0b1420;border:1px solid #1a2d45;border-radius:6px}
+.attr-heading{font-size:.62rem;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}
+.attr-note{font-size:.65rem;color:#374151;margin-bottom:10px;line-height:1.5}
+.attr-sources{display:flex;flex-direction:column;gap:5px}
+.attr-src-row{display:flex;align-items:baseline;gap:8px}
+.attr-src-name{font-size:.7rem;font-weight:700;color:#7dd3fc;min-width:80px;flex-shrink:0}
+.attr-src-cols{font-size:.72rem;color:#94a3b8}
+/* timeline direction label */
+.timeline-label{font-size:.58rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px 0}
 
 /* context group */
 .ctx-group{margin-bottom:8px}
@@ -1162,11 +1168,11 @@ function renderTrace() {
     return;
   }
 
-  const steps   = [...(trace.steps || [])].reverse();
-  const groups  = groupByContext(steps);
+  const steps    = trace.steps || [];   // chronological order — oldest first
+  const groups   = groupByContext(steps);
   const srcPairs = trace.sources || [];  // [{src_id, col, src_name}]
 
-  // Highlight source chips that directly contributed to this column
+  // Highlight source chips in left panel that contributed to this column
   document.querySelectorAll('.col-chip').forEach(el => {
     const contributed = srcPairs.some(p =>
       (p.src_id ? p.src_id === el.dataset.srcId : true) && p.col === el.dataset.col
@@ -1174,25 +1180,34 @@ function renderTrace() {
     el.classList.toggle('trace-source', contributed);
   });
 
-  const srcChips = srcPairs.map(p => {
+  // Group source columns by their source DataFrame for readable attribution
+  const bySource = {};
+  srcPairs.forEach(p => {
     const sid   = p.src_id || COL_TO_SRC_ID[p.col] || '';
-    const sname = p.src_name || (SRC_MAP[sid] || {}).name || '';
-    const label = sname ? p.col + ' \u2190 ' + sname : p.col;
-    return `<span class="src-ref-chip" onclick="selectSrcCol('${esc(sid)}','${esc(p.col)}')" title="Derived from ${esc(sname ? sname + '.' + p.col : p.col)}">${esc(label)}</span>`;
-  }).join('');
+    const sname = p.src_name || (SRC_MAP[sid] || {}).name || sid.slice(0, 8);
+    if (!bySource[sname]) bySource[sname] = [];
+    bySource[sname].push(p.col);
+  });
 
-  // Fallback attribution when no column-level sources (e.g. count(*), count(1))
-  // Still show which source DF(s) the column was created from
   const hasCreated = steps.some(s => s.role === 'created');
   let attributionHTML = '';
-  if (srcChips) {
-    attributionHTML = '<div class="src-refs"><span class="src-refs-label">derived from</span>' + srcChips + '</div>';
+  if (srcPairs.length > 0) {
+    const srcRows = Object.entries(bySource).map(([sname, cols]) =>
+      `<div class="attr-src-row"><span class="attr-src-name">${esc(sname)}</span><span class="attr-src-cols">${cols.map(esc).join(', ')}</span></div>`
+    ).join('');
+    attributionHTML = `
+      <div class="trace-attribution">
+        <div class="attr-heading">Root source columns</div>
+        <div class="attr-note">Traced back through all intermediate transformations to their origin. Column names in the steps below may include intermediates not listed here.</div>
+        <div class="attr-sources">${srcRows}</div>
+      </div>`;
   } else if (hasCreated && t.source_dfs && t.source_dfs.length) {
-    const dfChips = t.source_dfs.map(s => {
-      const sname = s.name || (s.id || '').slice(0, 8);
-      return `<span class="src-ref-chip" onclick="toggleSrcSelect('${esc(s.id)}')">${esc(sname)}</span>`;
-    }).join('');
-    attributionHTML = `<div class="src-refs"><span class="src-refs-label">created from</span>${dfChips}<span style="color:#64748b;font-size:.62rem;margin-left:6px">(whole-dataset aggregate \u2014 no single column input)</span></div>`;
+    const dfNames = t.source_dfs.map(s => s.name || (s.id || '').slice(0, 8)).join(', ');
+    attributionHTML = `
+      <div class="trace-attribution">
+        <div class="attr-heading">Whole-dataset aggregate</div>
+        <div class="attr-note">This column (e.g. count(*)) does not derive from specific input columns \u2014 it aggregates across the entire dataset. Source DataFrames: <b>${esc(dfNames)}</b>.</div>
+      </div>`;
   }
 
   const timelineHTML = groups.map((g, i) => renderGroup(g, i)).join('');
@@ -1211,6 +1226,7 @@ function renderTrace() {
       </div>
       ${attributionHTML}
     </div>
+    <div class="timeline-label">Transformation steps \u2014 oldest first</div>
     <div class="timeline">${timelineHTML || '<p class="empty-msg">No steps</p>'}</div>`;
 }
 
