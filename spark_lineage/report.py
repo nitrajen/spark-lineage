@@ -328,9 +328,23 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
     """
     Build the vertical trace for a single column.
     Root nodes (operation=None) are labelled SOURCE, covering joined DataFrames.
+
+    Also detects 'intermediate' columns: column names referenced in the CREATED
+    expression that are neither root source columns nor the final target column.
+    These are computed columns that existed only in intermediate DataFrames (e.g.
+    gross_profit = quantity * unit_price before being aggregated as sum(gross_profit)).
+    They are traced through transparently but named explicitly in the output so the
+    reader understands why the expression mentions a name not in the source list.
     """
     steps = []
     expr: str = col
+
+    # Column names that exist in root (source) DataFrames
+    root_col_names: set = set()
+    for node in ancestor_nodes:
+        if node.operation is None:
+            root_col_names.update(node.output_cols or [])
+
     # sources: list of {src_id, col, src_name} — explicit source DF attribution
     if col_src_map:
         raw_pairs = sorted(col_src_map.get(col, set()), key=lambda t: t[1] if isinstance(t, tuple) else t)
@@ -348,6 +362,11 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
                 sources.append({"src_id": None, "col": item, "src_name": None})
     else:
         sources = []
+
+    # Intermediate columns: referenced in the CREATED step but not root source columns.
+    # These are columns that existed only in intermediate DataFrames and were consumed
+    # (e.g. via aggregation) before reaching the final target.
+    intermediates: list = []
 
     for node in ancestor_nodes:
         if col not in (node.output_cols or []):
@@ -367,6 +386,10 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
                 role = "created"
                 if node.args_repr:
                     expr = ", ".join(node.args_repr)
+                # Detect intermediate columns: direct refs that aren't root source cols
+                for ref in (node.column_refs or {}).get(col, []):
+                    if ref != col and ref not in root_col_names:
+                        intermediates.append(ref)
             elif col in (node.column_refs or {}) and set(node.column_refs[col]) != {col}:
                 role = "modified"
             else:
@@ -381,7 +404,8 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
             "context_key": caller["context_key"] if caller else "",
         })
 
-    return {"expr": expr, "sources": sources, "steps": steps}
+    return {"expr": expr, "sources": sources, "steps": steps,
+            "intermediates": intermediates}
 
 
 def _compute_source_influence(src_id: str, source_cols: list, targets: list) -> dict:
@@ -581,6 +605,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .attr-src-row{display:flex;align-items:baseline;gap:8px}
 .attr-src-name{font-size:.7rem;font-weight:700;color:#7dd3fc;min-width:80px;flex-shrink:0}
 .attr-src-cols{font-size:.72rem;color:#94a3b8}
+.attr-intermediate{margin-top:10px;padding:8px 10px;background:#1a1206;border:1px solid #78350f;border-radius:5px;font-size:.65rem;color:#d97706;line-height:1.6}
+.attr-int-label{font-weight:700;margin-right:4px}
+.attr-int-col{background:#2d1a00;color:#fb923c;padding:1px 5px;border-radius:3px;font-size:.65rem}
 /* timeline direction label */
 .timeline-label{font-size:.58rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px 0}
 
@@ -1189,17 +1216,27 @@ function renderTrace() {
     bySource[sname].push(p.col);
   });
 
-  const hasCreated = steps.some(s => s.role === 'created');
+  const hasCreated   = steps.some(s => s.role === 'created');
+  const intermediates = trace.intermediates || [];
   let attributionHTML = '';
   if (srcPairs.length > 0) {
     const srcRows = Object.entries(bySource).map(([sname, cols]) =>
       `<div class="attr-src-row"><span class="attr-src-name">${esc(sname)}</span><span class="attr-src-cols">${cols.map(esc).join(', ')}</span></div>`
     ).join('');
+    // If the expression referenced intermediate columns, call them out explicitly
+    const intNote = intermediates.length
+      ? `<div class="attr-intermediate">
+           <span class="attr-int-label">\u26a0 Via intermediate column${intermediates.length > 1 ? 's' : ''}:</span>
+           ${intermediates.map(c => `<code class="attr-int-col">${esc(c)}</code>`).join(', ')}
+           \u2014 computed within the pipeline but not present in any source or target DataFrame.
+           The root columns above are what <code>${esc(STATE.activeCol)}</code> ultimately depends on.
+         </div>`
+      : '';
     attributionHTML = `
       <div class="trace-attribution">
         <div class="attr-heading">Root source columns</div>
-        <div class="attr-note">Traced back through all intermediate transformations to their origin. Column names in the steps below may include intermediates not listed here.</div>
         <div class="attr-sources">${srcRows}</div>
+        ${intNote}
       </div>`;
   } else if (hasCreated && t.source_dfs && t.source_dfs.length) {
     const dfNames = t.source_dfs.map(s => s.name || (s.id || '').slice(0, 8)).join(', ');
@@ -1226,7 +1263,7 @@ function renderTrace() {
       </div>
       ${attributionHTML}
     </div>
-    <div class="timeline-label">Transformation steps \u2014 oldest first</div>
+    <div class="timeline-label">How this column was built \u2014 top is where it was created, bottom is its final state</div>
     <div class="timeline">${timelineHTML || '<p class="empty-msg">No steps</p>'}</div>`;
 }
 
