@@ -390,6 +390,7 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
                 for ref in (node.column_refs or {}).get(col, []):
                     if ref != col and ref not in root_col_names:
                         intermediates.append(ref)
+                break  # only scan the CREATED node; done
             elif col in (node.column_refs or {}) and set(node.column_refs[col]) != {col}:
                 role = "modified"
             else:
@@ -404,8 +405,33 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
             "context_key": caller["context_key"] if caller else "",
         })
 
+    # Resolve the definition of each intermediate column from ancestor nodes.
+    # For each intermediate, find the node where it was first created and extract
+    # its expression, source column refs, and file:line.
+    intermediate_defs: list = []
+    for inter_col in intermediates:
+        for node in ancestor_nodes:
+            if inter_col not in (node.output_cols or []):
+                continue
+            if node.operation is None:
+                break  # root — shouldn't happen since we filtered root_col_names
+            parent_had = any(
+                inter_col in (_registry.get(pid).output_cols or [])
+                for pid in node.parent_ids
+                if _registry.get(pid)
+            )
+            if not parent_had:
+                intermediate_defs.append({
+                    "col":       inter_col,
+                    "operation": node.operation,
+                    "refs":      list((node.column_refs or {}).get(inter_col, [])),
+                    "args":      node.args_repr or [],
+                    "caller":    _caller_dict(node.caller),
+                })
+                break
+
     return {"expr": expr, "sources": sources, "steps": steps,
-            "intermediates": intermediates}
+            "intermediates": intermediate_defs}
 
 
 def _compute_source_influence(src_id: str, source_cols: list, targets: list) -> dict:
@@ -606,8 +632,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .attr-src-name{font-size:.7rem;font-weight:700;color:#7dd3fc;min-width:80px;flex-shrink:0}
 .attr-src-cols{font-size:.72rem;color:#94a3b8}
 .attr-intermediate{margin-top:10px;padding:8px 10px;background:#1a1206;border:1px solid #78350f;border-radius:5px;font-size:.65rem;color:#d97706;line-height:1.6}
-.attr-int-label{font-weight:700;margin-right:4px}
-.attr-int-col{background:#2d1a00;color:#fb923c;padding:1px 5px;border-radius:3px;font-size:.65rem}
+.attr-int-label{font-weight:700;margin-bottom:6px}
+.attr-int-row{margin-top:5px;padding:5px 0;border-top:1px solid #2d1a00;display:flex;flex-wrap:wrap;align-items:baseline;gap:5px}
+.attr-int-col{background:#2d1a00;color:#fb923c;padding:1px 5px;border-radius:3px;font-size:.68rem;font-family:'SF Mono',Consolas,monospace}
+.attr-int-op{font-size:.62rem;color:#92400e}
+.attr-int-loc{font-size:.6rem;color:#92400e;font-family:'SF Mono',Consolas,monospace}
+.attr-int-expr{font-size:.62rem;color:#a16207;width:100%;margin-top:2px;word-break:break-all}
+.attr-int-full{color:#78350f;font-family:'SF Mono',Consolas,monospace}
 /* timeline direction label */
 .timeline-label{font-size:.58rem;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.08em;margin:18px 0 8px 0}
 
@@ -1216,20 +1247,29 @@ function renderTrace() {
     bySource[sname].push(p.col);
   });
 
-  const hasCreated   = steps.some(s => s.role === 'created');
-  const intermediates = trace.intermediates || [];
+  const hasCreated    = steps.some(s => s.role === 'created');
+  const intermediates = trace.intermediates || [];  // [{col, operation, refs, args, caller}]
   let attributionHTML = '';
   if (srcPairs.length > 0) {
     const srcRows = Object.entries(bySource).map(([sname, cols]) =>
       `<div class="attr-src-row"><span class="attr-src-name">${esc(sname)}</span><span class="attr-src-cols">${cols.map(esc).join(', ')}</span></div>`
     ).join('');
-    // If the expression referenced intermediate columns, call them out explicitly
+    // Show each intermediate's full definition so the reader can follow the chain
     const intNote = intermediates.length
       ? `<div class="attr-intermediate">
-           <span class="attr-int-label">\u26a0 Via intermediate column${intermediates.length > 1 ? 's' : ''}:</span>
-           ${intermediates.map(c => `<code class="attr-int-col">${esc(c)}</code>`).join(', ')}
-           \u2014 computed within the pipeline but not present in any source or target DataFrame.
-           The root columns above are what <code>${esc(STATE.activeCol)}</code> ultimately depends on.
+           <div class="attr-int-label">\u26a0 Computed via intermediate column${intermediates.length > 1 ? 's' : ''} (not in any source or target DataFrame):</div>
+           ${intermediates.map(im => {
+             const loc  = im.caller ? im.caller.file_short + ':' + im.caller.line : '';
+             const refs = im.refs.length ? ' derived from: ' + im.refs.map(esc).join(', ') : '';
+             const expr = im.args.length ? im.args.map(esc).join(', ') : '';
+             return `<div class="attr-int-row">
+               <code class="attr-int-col">${esc(im.col)}</code>
+               <span class="attr-int-op">.${esc(im.operation)}()</span>
+               ${loc ? `<span class="attr-int-loc">${esc(loc)}</span>` : ''}
+               ${refs ? `<div class="attr-int-expr">${refs}</div>` : ''}
+               ${expr ? `<div class="attr-int-expr attr-int-full">${expr}</div>` : ''}
+             </div>`;
+           }).join('')}
          </div>`
       : '';
     attributionHTML = `
