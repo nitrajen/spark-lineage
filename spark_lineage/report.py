@@ -390,7 +390,6 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
                 for ref in (node.column_refs or {}).get(col, []):
                     if ref != col and ref not in root_col_names:
                         intermediates.append(ref)
-                break  # only scan the CREATED node; done
             elif col in (node.column_refs or {}) and set(node.column_refs[col]) != {col}:
                 role = "modified"
             else:

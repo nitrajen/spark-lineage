@@ -201,13 +201,26 @@ class SalesAnalyticsPipeline:
             )
         )
 
-        # Tier + tenure
+        # Intermediate: spend_per_order — lifetime_value divided by order_count.
+        # Used subsequently to drive tier logic alongside lifetime_value.
+        with_spend_rate = ltv_raw.withColumn(
+            "spend_per_order",
+            F.round(F.col("lifetime_value") / F.col("order_count"), 2),
+        )
+
+        # Tier + tenure (tier now also considers spend_per_order as a signal)
         result = (
-            ltv_raw
+            with_spend_rate
             .withColumn(
                 "tier",
-                F.when(F.col("lifetime_value") >= 3000, "Gold")
-                .when(F.col("lifetime_value") >= 1200, "Silver")
+                F.when(
+                    (F.col("lifetime_value") >= 3000) | (F.col("spend_per_order") >= 600),
+                    "Gold",
+                )
+                .when(
+                    (F.col("lifetime_value") >= 1200) | (F.col("spend_per_order") >= 300),
+                    "Silver",
+                )
                 .otherwise("Bronze"),
             )
             .withColumn(
@@ -297,19 +310,23 @@ class SalesAnalyticsPipeline:
             )
         )
 
-        # Revenue per month × channel
+        # Intermediate: raw line revenue before discount, computed per-row before aggregation
+        with_raw = with_time.withColumn(
+            "raw_revenue",
+            F.round(F.col("quantity") * F.col("unit_price"), 2),
+        )
+
+        # Revenue per month × channel (net_revenue uses raw_revenue as its base)
         monthly = (
-            with_time
+            with_raw
             .withColumn(
                 "net_revenue",
-                F.round(
-                    F.col("quantity") * F.col("unit_price") * (1 - F.col("discount_rate")),
-                    2,
-                ),
+                F.round(F.col("raw_revenue") * (1 - F.col("discount_rate")), 2),
             )
             .groupBy("year_month", "quarter", "channel")
             .agg(
                 F.round(F.sum("net_revenue"), 2).alias("revenue"),
+                F.round(F.sum("raw_revenue"), 2).alias("gross_revenue"),
                 F.count("*").alias("order_count"),
                 F.countDistinct("customer_id").alias("active_customers"),
                 F.round(F.avg("discount_rate") * 100, 2).alias("avg_discount_pct"),
@@ -357,7 +374,8 @@ class SalesAnalyticsPipeline:
             )
         )
 
-        # Net revenue considering both order discount + campaign bonus discount
+        # Intermediate: per-order budget weight (fraction of budget this order "consumes")
+        # Used in downstream aggregation to compute cost_per_impression proxy
         with_net = with_campaign.withColumn(
             "combined_discount",
             F.least(F.col("discount_rate") + F.col("bonus_discount"), F.lit(0.40)),
@@ -381,9 +399,21 @@ class SalesAnalyticsPipeline:
             )
         )
 
-        # ROI and efficiency grade
+        # Intermediate: cost_per_order computed before efficiency grade uses it
+        with_cost = by_channel.withColumn(
+            "cost_per_order",
+            F.round(F.col("budget_usd") / F.col("orders_in_campaign"), 2),
+        )
+
+        # Intermediate: cost_per_customer derived from cost_per_order × orders_in_campaign / reached_customers
+        with_cost_per_customer = with_cost.withColumn(
+            "cost_per_customer",
+            F.round(F.col("budget_usd") / F.col("reached_customers"), 2),
+        )
+
+        # ROI and efficiency grade (efficiency_grade uses roi_pct which is a new intermediate)
         result = (
-            by_channel
+            with_cost_per_customer
             .withColumn(
                 "roi_pct",
                 F.round(
@@ -391,10 +421,6 @@ class SalesAnalyticsPipeline:
                     / F.col("budget_usd") * 100,
                     1,
                 ),
-            )
-            .withColumn(
-                "cost_per_order",
-                F.round(F.col("budget_usd") / F.col("orders_in_campaign"), 2),
             )
             .withColumn(
                 "efficiency_grade",
@@ -417,28 +443,38 @@ class SalesAnalyticsPipeline:
 
 # ── Sources — track at the boundary ──────────────────────────────────────────
 
-orders = spl.track_df(
-    spark.createDataFrame(orders_data, orders_schema),
-    name="orders",
-)
+def load_sources(spark):
+    """
+    Load all in-memory source DataFrames and register them with spark_lineage.
+    Calling track_df inside a named function gives a meaningful FQN in the report,
+    e.g. ``test_comprehensive.load_sources:NNN`` instead of bare ``test_comprehensive:NNN``.
+    """
+    orders = spl.track_df(
+        spark.createDataFrame(orders_data, orders_schema),
+        name="orders",
+    )
 
-customers = spl.track_df(
-    spark.createDataFrame(customers_data, customer_schema),
-    name="customers",
-)
+    customers = spl.track_df(
+        spark.createDataFrame(customers_data, customer_schema),
+        name="customers",
+    )
 
-products = spl.track_df(
-    spark.createDataFrame(products_data, product_schema),
-    name="products",
-)
+    products = spl.track_df(
+        spark.createDataFrame(products_data, product_schema),
+        name="products",
+    )
 
-campaigns = spl.track_df(
-    spark.createDataFrame(campaigns_data, campaign_schema),
-    name="campaigns",
-)
+    campaigns = spl.track_df(
+        spark.createDataFrame(campaigns_data, campaign_schema),
+        name="campaigns",
+    )
+
+    return orders, customers, products, campaigns
+
 
 # ── Run pipeline ──────────────────────────────────────────────────────────────
 
+orders, customers, products, campaigns = load_sources(spark)
 pipeline = SalesAnalyticsPipeline()
 ltv, perf, trends, campaign_eff = pipeline.run(orders, customers, products, campaigns)
 
