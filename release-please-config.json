@@ -1,0 +1,15 @@
+{
+  "release-type": "python",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "spark-lineage",
+      "changelog-sections": [
+        {"type": "feat",     "section": "Features"},
+        {"type": "fix",      "section": "Bug Fixes"},
+        {"type": "perf",     "section": "Performance"},
+        {"type": "breaking", "section": "Breaking Changes"}
+      ]
+    }
+  }
+}

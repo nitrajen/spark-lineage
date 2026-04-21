@@ -117,7 +117,7 @@ def _build_json(source_id: str, source_df, title: str) -> dict:
           }
         }
       ]
-      targets: [                    ← every leaf (materialized) DataFrame
+      targets: [                    ← write nodes (persisted outputs) or leaf DataFrames if no writes
         {
           id, label, caller,
           source_dfs,               ← subset of sources[] that fed this target
@@ -142,12 +142,18 @@ def _build_json(source_id: str, source_df, title: str) -> dict:
     except Exception:
         source_cols = list(source_node.output_cols) if source_node else []
 
-    leaf_ids = _registry.get_leaf_descendants(source_id)
+    # Prefer write nodes (actual persisted outputs) as targets.
+    # Fall back to leaf DataFrames if no writes exist (e.g. exploratory / test pipelines).
+    all_desc   = _registry.get_all_descendants(source_id)
+    write_ids  = [d for d in all_desc
+                  if (_registry.get(d) and
+                      (_registry.get(d).operation or "").startswith("write."))]
+    target_ids = write_ids if write_ids else _registry.get_leaf_descendants(source_id)
 
     targets: list[dict]          = []
     all_src_map: dict[str, dict] = {}   # id → source entry (built incrementally)
 
-    for tid in leaf_ids:
+    for tid in target_ids:
         node = _registry.get(tid)
         if node is None:
             continue
@@ -371,6 +377,9 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
     for node in ancestor_nodes:
         if col not in (node.output_cols or []):
             continue
+        # Write nodes are persistence ops — they don't transform columns, skip them
+        if (node.operation or "").startswith("write."):
+            continue
 
         caller = _caller_dict(node.caller)
 
@@ -405,29 +414,48 @@ def _build_col_trace(col: str, ancestor_nodes: list[LineageNode],
         })
 
     # Resolve the definition of each intermediate column from ancestor nodes.
-    # For each intermediate, find the node where it was first created and extract
-    # its expression, source column refs, and file:line.
-    intermediate_defs: list = []
-    for inter_col in intermediates:
+    # Recursively expands: if an intermediate's own refs are also intermediates
+    # (not in root_col_names), they are resolved too — ordered from deepest
+    # ancestor to direct intermediate so the flow reads chronologically.
+    seen_intermediates: set = set()
+
+    def _resolve_one(inter_col: str) -> list:
+        """Return list of intermediate defs for inter_col (recursing into its refs)."""
+        if inter_col in seen_intermediates:
+            return []
+        seen_intermediates.add(inter_col)
+
         for node in ancestor_nodes:
             if inter_col not in (node.output_cols or []):
                 continue
             if node.operation is None:
-                break  # root — shouldn't happen since we filtered root_col_names
+                return []  # root column — stop
             parent_had = any(
                 inter_col in (_registry.get(pid).output_cols or [])
                 for pid in node.parent_ids
                 if _registry.get(pid)
             )
             if not parent_had:
-                intermediate_defs.append({
+                refs = list((node.column_refs or {}).get(inter_col, []))
+                entry = {
                     "col":       inter_col,
                     "operation": node.operation,
-                    "refs":      list((node.column_refs or {}).get(inter_col, [])),
+                    "refs":      refs,
                     "args":      node.args_repr or [],
                     "caller":    _caller_dict(node.caller),
-                })
-                break
+                }
+                # Recurse into refs that are themselves non-root intermediates
+                sub_defs: list = []
+                for ref in refs:
+                    if ref != inter_col and ref not in root_col_names:
+                        sub_defs.extend(_resolve_one(ref))
+                # sub_defs first (deeper ancestors), then this column
+                return sub_defs + [entry]
+        return []
+
+    intermediate_defs: list = []
+    for inter_col in intermediates:
+        intermediate_defs.extend(_resolve_one(inter_col))
 
     return {"expr": expr, "sources": sources, "steps": steps,
             "intermediates": intermediate_defs}
@@ -509,7 +537,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .src-df-header:hover{background:#1a2235}
 .src-df-chevron{font-size:.6rem;color:#374151;width:12px;flex-shrink:0;transition:transform .15s}
 .src-df-header.expanded .src-df-chevron{transform:rotate(90deg)}
-.src-df-label{font-size:.72rem;font-weight:600;color:#7dd3fc;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.src-df-label{font-size:.72rem;font-weight:600;color:#cbd5e1;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .src-df-header.secondary .src-df-label{color:#94a3b8}
 .src-df-loc{font-size:.6rem;color:#374151;white-space:nowrap}
 /* FQN is the stable identifier — shown prominently so engineers can locate the DF in code */
@@ -569,10 +597,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* per-source-df breakdown */
 .src-section{margin:18px 0 6px 0}
 .src-section-hdr{display:flex;align-items:baseline;gap:8px;padding:0 0 6px 0;border-bottom:1px solid #1a2235;margin-bottom:10px}
-.src-section-name{font-size:.72rem;font-weight:700;color:#7dd3fc}
+.src-section-name{font-size:.72rem;font-weight:700;color:#e2e8f0}
 .src-section-fqn{font-size:.62rem;color:#4b5563;font-family:'SF Mono',Consolas,monospace}
 .src-col-group{margin-bottom:10px}
 .src-col-group-label{font-size:.57rem;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px}
+.src-col-group-label.created{color:#38bdf8}.src-col-group-label.modified{color:#fb923c}.src-col-group-label.passthrough{color:#64748b}
 .src-col-row-item{display:flex;align-items:baseline;flex-wrap:wrap;gap:3px;margin-bottom:4px}
 .src-attr-arrow{font-size:.65rem;color:#374151;margin:0 2px}
 .src-attr-chip{font-size:.68rem;color:#4b5563;white-space:nowrap}
@@ -581,7 +610,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .t-ov-chip{font-size:.75rem;cursor:pointer;white-space:nowrap;padding:0;background:transparent;border:none}
 .t-ov-chip.created{color:#cbd5e1}
 .t-ov-chip.modified{color:#cbd5e1}
-.t-ov-chip.passthrough{color:#64748b}
+.t-ov-chip.passthrough{color:#cbd5e1}
 .t-ov-chip:hover{color:#7dd3fc;text-decoration:underline}
 .t-ov-desc{font-size:.65rem;color:#4b5563;margin:-4px 0 10px 0;line-height:1.5}
 .src-summary-list{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
@@ -679,6 +708,38 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .step-args{font-family:'SF Mono',Consolas,monospace;font-size:.65rem;color:#6b7280;margin-top:3px;white-space:pre-wrap;word-break:break-all;max-height:64px;overflow-y:auto}
 .step-loc{font-size:.62rem;color:#2d3f55;margin-top:4px}
 .step-loc span{color:#374151}
+/* ── flow trace (new linear design) ─────────────────────────────────────── */
+.flow-container{padding:4px 0 16px 0;display:flex;flex-direction:column;gap:0}
+.flow-card{padding:12px 16px;border-radius:7px;border:1px solid;margin:0}
+.flow-card.from{background:#052e16;border-color:#166534}
+.flow-card.created{background:#0c2340;border-color:#1d4ed8}
+.flow-card.modified{background:#431407;border-color:#c2410c}
+.flow-card.intermediate{background:#1a1206;border-color:#78350f}
+.flow-card.output{background:#0a1628;border-color:#334155}
+.flow-card-label{font-size:.58rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.flow-card.from .flow-card-label{color:#34d399}
+.flow-card.created .flow-card-label{color:#38bdf8}
+.flow-card.modified .flow-card-label{color:#fb923c}
+.flow-card.intermediate .flow-card-label{color:#d97706}
+.flow-card.output .flow-card-label{color:#60a5fa}
+.flow-arrow-connector{text-align:center;font-size:.9rem;color:#374151;padding:3px 0;line-height:1.4;user-select:none}
+.flow-arrow-connector.passthrough{font-size:.62rem;color:#4b5563;padding:2px 0}
+.flow-src-row{display:flex;gap:8px;align-items:baseline;margin-bottom:3px;font-size:.78rem}
+.flow-src-dfname{color:#34d399;font-weight:600;font-size:.72rem;white-space:nowrap}
+.flow-src-cols{color:#94a3b8}
+.flow-step-op{font-size:.85rem;font-weight:600;color:#e2e8f0;margin-bottom:2px}
+.flow-step-args{font-family:'SF Mono',Consolas,monospace;font-size:.63rem;color:#6b7280;margin-top:4px;white-space:pre-wrap;word-break:break-all;max-height:80px;overflow-y:auto}
+.flow-step-loc{font-size:.62rem;color:#374151;margin-top:4px}
+.flow-int-col{background:#2d1a00;color:#fb923c;padding:1px 6px;border-radius:3px;font-size:.75rem;font-family:'SF Mono',Consolas,monospace}
+.flow-out-name{font-size:.88rem;font-weight:600;color:#93c5fd;margin-bottom:2px}
+.flow-out-loc{font-size:.62rem;color:#374151;margin-top:2px}
+.flow-passthrough-note{font-size:.7rem;color:#4b5563;padding:6px 10px;border:1px dashed #1e2d40;border-radius:5px;text-align:center}
+/* attribution chips in overview (group-by-role design) */
+.src-attr-dfname{font-size:.62rem;font-weight:600;color:#64748b;margin-right:2px}
+.src-attr-dot{font-size:.6rem;color:#374151;margin:0 4px}
+/* role tooltip */
+#role-tooltip{position:fixed;z-index:9999;max-width:340px;padding:10px 14px;background:#111827;border:1px solid #1d4ed8;border-radius:7px;font-size:.7rem;color:#cbd5e1;line-height:1.6;pointer-events:none;display:none;box-shadow:0 6px 24px rgba(0,0,0,.6)}
+[data-role-tip]{cursor:help;text-decoration:underline dotted currentColor;text-underline-offset:2px}
 </style>
 </head>
 <body>
@@ -719,20 +780,20 @@ DATA.targets.forEach(t => { TGT_MAP[t.id] = t; });
 // ── application state ──────────────────────────────────────────────────────
 // Hierarchical selection: source DFs → source columns → target → target column
 //
-// activeSrcIds   : Set<srcId>  — source DFs whose accordion is open / selected
+// activeSrcIds   : Set<srcId>  — source DFs selected for AND filtering (populated by col chip clicks only)
 //                  DF mode: highlight targets that are fed by ALL selected DFs (AND)
 // activeSrcCols  : Map<"srcId|col", {srcId, col}> — multi-selected source columns
 //                  Column mode: highlight targets/cols influenced by ANY selected col (OR)
 // activeTarget   : selected target DF id
 // activeCol      : selected target column
 const STATE = {
-  activeSrcIds:  new Set(),   // DF multi-select (AND filter on targets)
-  activeSrcCols: new Map(),   // column multi-select: key = "srcId|col"
-  activeTarget:  null,
+  activeSrcIds:   new Set(),   // DF multi-select (AND filter on targets) — populated by col chip clicks only
+  expandedSrcIds: new Set(),   // DFs whose accordion is manually expanded — independent of selection
+  activeSrcCols:  new Map(),   // column multi-select: key = "srcId|col"
+  activeTarget:   null,
   activeCol:     null,
 };
 
-const GRP_COLLAPSED = {};
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function esc(s) {
@@ -796,9 +857,10 @@ function feedingSrcNames(tid) {
 }
 
 function targetName(t) {
+  if (t.name)  return t.name;    // write dest / explicit name (path or FQN) — most specific
+  if (t.label) return t.label;   // node label
   if (t.caller && t.caller.qualname) return t.caller.qualname + '()';
-  if (t.name) return t.name;
-  return t.label;
+  return t.id ? t.id.slice(0, 8) : '?';
 }
 function targetSub(t) {
   return t.caller ? t.caller.file_short + ':' + t.caller.line : '';
@@ -858,7 +920,7 @@ function buildSourcePanel() {
       hdr.appendChild(fqnEl);
     }
 
-    hdr.onclick = () => toggleSrcSelect(src.id);
+    hdr.onclick = () => toggleSrcExpand(src.id);
     entry.appendChild(hdr);
 
     const colsWrap = document.createElement('div');
@@ -879,16 +941,14 @@ function buildSourcePanel() {
   });
 }
 
-// Toggle selection+expansion of a source DF (multi-select)
-function toggleSrcSelect(srcId) {
-  if (STATE.activeSrcIds.has(srcId)) {
-    STATE.activeSrcIds.delete(srcId);
-    // Clear any source columns belonging to this DF
-    STATE.activeSrcCols.forEach((v, k) => { if (v.srcId === srcId) STATE.activeSrcCols.delete(k); });
+// Toggle accordion expansion of a source DF — does NOT affect selection/filtering
+function toggleSrcExpand(srcId) {
+  if (STATE.expandedSrcIds.has(srcId)) {
+    STATE.expandedSrcIds.delete(srcId);
   } else {
-    STATE.activeSrcIds.add(srcId);
+    STATE.expandedSrcIds.add(srcId);
   }
-  render();
+  updateSrcPanelUI();
 }
 
 // Source DFs that contribute to the currently selected target column (for auto-expand)
@@ -908,10 +968,10 @@ function updateSrcPanelUI() {
     const cols = document.getElementById('srccols_' + src.id);
     if (!hdr || !cols) return;
     const selected  = STATE.activeSrcIds.has(src.id);
-    const traceOpen = traceSrcs.has(src.id);
+    const expanded  = STATE.expandedSrcIds.has(src.id) || selected || traceSrcs.has(src.id);
     hdr.classList.toggle('selected',  selected);
-    hdr.classList.toggle('expanded',  selected || traceOpen);
-    cols.classList.toggle('open',     selected || traceOpen);
+    hdr.classList.toggle('expanded',  expanded);
+    cols.classList.toggle('open',     expanded);
   });
 }
 
@@ -921,10 +981,14 @@ function selectSrcCol(srcId, col) {
   const key = srcId + '|' + col;
   if (STATE.activeSrcCols.has(key)) {
     STATE.activeSrcCols.delete(key);
+    // If no columns from this DF remain selected, remove DF from activeSrcIds
+    const stillHas = Array.from(STATE.activeSrcCols.values()).some(v => v.srcId === srcId);
+    if (!stillHas) STATE.activeSrcIds.delete(srcId);
   } else {
     STATE.activeSrcCols.set(key, {srcId, col});
-    STATE.activeSrcIds.add(srcId);   // ensure the DF accordion stays open
-    STATE.activeCol = null;          // clear target-column mode
+    STATE.activeSrcIds.add(srcId);     // DF is now active (AND filter)
+    STATE.expandedSrcIds.add(srcId);   // ensure accordion stays open
+    STATE.activeCol = null;            // clear target-column mode
   }
   render();
 }
@@ -1046,75 +1110,63 @@ function renderMain() {
 }
 
 // ── per-source breakdown helper ────────────────────────────────────────────
-// Groups every target column under the source DF(s) it comes from.
-// A column appears under EACH source DF that contributes to it (multi-source is fine).
-// Columns with no column-level attribution (count(*) etc.) go in an "Aggregated" section.
+// Groups every target column by transformation role (Created / Modified / Passthrough).
+// Each column appears once. Attribution shows ALL source DFs: col ← src1·col1, col2 · src2·col3
 function buildSrcSections(t, influenced, chip) {
-  const srcDFs = t.source_dfs || [];
-  const attribToAny = new Set();
+  const byRole = {created: [], modified: [], passthrough: []};
+  const unattrib = [];
 
-  const sections = srcDFs.map(src => {
-    const cls   = STATE.activeSrcIds.has(src.id) ? 'sel' : 'unsel';
-    const sname = src.name || src.id.slice(0, 6);
-    const fqn   = src.caller && src.caller.fqn ? src.caller.fqn : '';
+  t.columns.forEach(col => {
+    const trace   = (t.traces || {})[col] || {};
+    const sources = trace.sources || [];
+    const role    = (t.col_roles || {})[col] || 'passthrough';
+    if (sources.length > 0) {
+      byRole[role].push(col);
+    } else {
+      unattrib.push(col);
+    }
+  });
 
-    // Columns that have at least one source attribution from this source DF
-    const attrCols = t.columns.filter(col => {
-      const trace = (t.traces || {})[col];
-      return trace && (trace.sources || []).some(p => p.src_id === src.id);
+  // Build combined attribution for a column across ALL source DFs
+  function colAttribution(col) {
+    const trace   = (t.traces || {})[col] || {};
+    const sources = trace.sources || [];
+    const bySrc = new Map();
+    sources.forEach(p => {
+      const key = p.src_name || (p.src_id ? p.src_id.slice(0, 6) : '?');
+      if (!bySrc.has(key)) bySrc.set(key, []);
+      bySrc.get(key).push(p.col);
     });
-    attrCols.forEach(c => attribToAny.add(c));
-    if (!attrCols.length) return '';
-
-    const bySrcRole = {created: [], modified: [], passthrough: []};
-    attrCols.forEach(col => {
-      const role = (t.col_roles || {})[col] || 'passthrough';
-      (bySrcRole[role] = bySrcRole[role] || []).push(col);
+    if (!bySrc.size) return '';
+    const parts = [];
+    bySrc.forEach((cols, srcName) => {
+      const unique = [...new Set(cols)];
+      const colSpans = unique.map(c => `<span class="src-attr-chip">${esc(c)}</span>`).join('');
+      parts.push(`<span class="src-attr-dfname">${esc(srcName)}</span>${colSpans}`);
     });
+    return `<span class="src-attr-arrow">\u2190</span>${parts.join('<span class="src-attr-dot">\u00B7</span>')}`;
+  }
 
-    const roleGroups = ['created', 'modified', 'passthrough'].map(role => {
-      const cols = bySrcRole[role] || [];
-      if (!cols.length) return '';
-      const label = {created: 'Created', modified: 'Modified', passthrough: 'Passthrough'}[role];
-      const rows = cols.map(col => {
-        // Which source columns from THIS source DF feed into col?
-        const trace = (t.traces || {})[col] || {};
-        const srcColChips = (trace.sources || [])
-          .filter(p => p.src_id === src.id)
-          .map(p => `<span class="src-attr-chip">${esc(p.col)}</span>`)
-          .join('');
-        const attr = srcColChips
-          ? `<span class="src-attr-arrow">\u2190</span>${srcColChips}`
-          : '';
-        return `<div class="src-col-row-item">${chip(col, role)}${attr}</div>`;
-      }).join('');
-      return `<div class="src-col-group"><div class="src-col-group-label">${label}</div>${rows}</div>`;
-    }).join('');
-
-    return `<div class="src-section">
-      <div class="src-section-hdr">
-        <span class="src-section-name">${esc(sname)}</span>
-        ${fqn ? `<span class="src-section-fqn">${esc(fqn)}</span>` : ''}
-      </div>
-      ${roleGroups}
+  const roleSections = ['created', 'modified', 'passthrough'].map(role => {
+    const cols = byRole[role] || [];
+    if (!cols.length) return '';
+    return `<div class="src-col-group">
+      <div class="src-col-group-label ${role}"><span data-role-tip="${role}">${role.charAt(0).toUpperCase()+role.slice(1)}</span></div>
+      ${cols.map(col =>
+        `<div class="src-col-row-item">${chip(col, role)}${colAttribution(col)}</div>`
+      ).join('')}
     </div>`;
   }).join('');
 
-  // Columns with no column-level attribution (e.g. count(*)) go in a separate section
-  const unattrib = t.columns.filter(c => !attribToAny.has(c));
-  const aggSection = unattrib.length ? `<div class="src-section">
-    <div class="src-section-hdr">
-      <span class="src-section-fqn">\u2014 Whole-dataset aggregates (no single column input)</span>
-    </div>
-    <div class="src-col-group">
-      ${unattrib.map(col => {
-        const role = (t.col_roles || {})[col] || 'created';
-        return `<div class="src-col-row-item">${chip(col, role)}<span class="no-attr-note">e.g. count(*)</span></div>`;
-      }).join('')}
-    </div>
+  const aggSection = unattrib.length ? `<div class="src-col-group">
+    <div class="src-col-group-label">Whole-dataset aggregates</div>
+    ${unattrib.map(col => {
+      const role = (t.col_roles || {})[col] || 'created';
+      return `<div class="src-col-row-item">${chip(col, role)}<span class="no-attr-note">e.g. count(*)</span></div>`;
+    }).join('')}
   </div>` : '';
 
-  return sections + aggSection;
+  return roleSections + aggSection;
 }
 
 // ── target overview ────────────────────────────────────────────────────────
@@ -1192,9 +1244,9 @@ function renderTargetOverview() {
       </div>
       <div class="t-ov-stats">
         <span class="t-ov-stat"><b>${t.columns.length}</b> columns</span>
-        ${(byRole.created || []).length   ? `<span class="t-ov-stat cr"><b>${byRole.created.length}</b> created</span>` : ''}
-        ${(byRole.modified || []).length  ? `<span class="t-ov-stat mo"><b>${byRole.modified.length}</b> modified</span>` : ''}
-        ${(byRole.passthrough || []).length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> passthrough</span>` : ''}
+        ${(byRole.created || []).length   ? `<span class="t-ov-stat cr"><b>${byRole.created.length}</b> <span data-role-tip="created">created</span></span>` : ''}
+        ${(byRole.modified || []).length  ? `<span class="t-ov-stat mo"><b>${byRole.modified.length}</b> <span data-role-tip="modified">modified</span></span>` : ''}
+        ${(byRole.passthrough || []).length ? `<span class="t-ov-stat"><b>${byRole.passthrough.length}</b> <span data-role-tip="passthrough">passthrough</span></span>` : ''}
       </div>
       ${inflSummaryHTML}
       <div class="t-ov-section" style="margin-top:12px">Source DataFrames</div>
@@ -1209,13 +1261,25 @@ function renderTargetOverview() {
           </div>`;
         }).join('')}
       </div>
-      <div class="t-ov-section" style="margin-top:22px">Target DataFrame Columns</div>
-      <p class="t-ov-desc">Every column in this target, grouped by which source DataFrame it originates from. Arrows (←) show the exact source column(s) each was derived from.</p>
+      <div class="t-ov-section" style="margin-top:22px">Columns
+        <span style="font-size:.62rem;font-weight:400;text-transform:none;letter-spacing:0;color:#4b5563;margin-left:10px">
+          <span style="color:#38bdf8">&#9679;</span> <span data-role-tip="created">created</span> &nbsp;
+          <span style="color:#fb923c">&#9679;</span> <span data-role-tip="modified">modified</span> &nbsp;
+          <span style="color:#64748b">&#9679;</span> <span data-role-tip="passthrough">passthrough</span>
+          <span style="color:#374151;margin-left:6px">— click any column to trace it</span>
+        </span>
+      </div>
+      <div class="t-ov-desc" style="line-height:1.9">
+        <div><b data-role-tip="created">Created</b>: new column computed by a new expression — did not exist in the source.</div>
+        <div><b data-role-tip="modified">Modified</b>: existing column recalculated with a different expression.</div>
+        <div><b data-role-tip="passthrough">Passthrough</b>: value flows unchanged — same value from source to output.</div>
+        <div style="margin-top:4px;color:#4b5563">Arrows (&#8592;) show source DataFrame \u00b7 column(s) each was derived from.</div>
+      </div>
       ${buildSrcSections(t, influenced, chip)}
     </div>`;
 }
 
-// ── column trace ───────────────────────────────────────────────────────────
+// ── column trace — linear flow from source to output ───────────────────────
 function renderTrace() {
   const t     = TGT_MAP[STATE.activeTarget];
   const trace = t && t.traces ? t.traces[STATE.activeCol] : null;
@@ -1225,11 +1289,12 @@ function renderTrace() {
     return;
   }
 
-  const steps    = trace.steps || [];   // chronological order — oldest first
-  const groups   = groupByContext(steps);
-  const srcPairs = trace.sources || [];  // [{src_id, col, src_name}]
+  const steps         = trace.steps || [];
+  const srcPairs      = trace.sources || [];
+  const intermediates = trace.intermediates || [];
+  const hasCreated    = steps.some(s => s.role === 'created');
 
-  // Highlight source chips in left panel that contributed to this column
+  // Highlight contributing source chips in left panel
   document.querySelectorAll('.col-chip').forEach(el => {
     const contributed = srcPairs.some(p =>
       (p.src_id ? p.src_id === el.dataset.srcId : true) && p.col === el.dataset.col
@@ -1237,56 +1302,93 @@ function renderTrace() {
     el.classList.toggle('trace-source', contributed);
   });
 
-  // Group source columns by their source DataFrame for readable attribution
-  const bySource = {};
+  // Group source pairs by source DF name (for FROM block)
+  const bySource = new Map();
   srcPairs.forEach(p => {
     const sid   = p.src_id || COL_TO_SRC_ID[p.col] || '';
     const sname = p.src_name || (SRC_MAP[sid] || {}).name || sid.slice(0, 8);
-    if (!bySource[sname]) bySource[sname] = [];
-    bySource[sname].push(p.col);
+    if (!bySource.has(sname)) bySource.set(sname, []);
+    bySource.get(sname).push(p.col);
   });
 
-  const hasCreated    = steps.some(s => s.role === 'created');
-  const intermediates = trace.intermediates || [];  // [{col, operation, refs, args, caller}]
-  let attributionHTML = '';
+  const meaningfulSteps  = steps.filter(s => s.role === 'created' || s.role === 'modified');
+  const passthroughCount = steps.filter(s => s.role === 'passthrough').length;
+
+  const parts = [];
+  const arrow = (note) => parts.push(
+    note
+      ? `<div class="flow-arrow-connector passthrough">\u2193 &nbsp; ${note}</div>`
+      : `<div class="flow-arrow-connector">\u2193</div>`
+  );
+
+  // 1. FROM block
   if (srcPairs.length > 0) {
-    const srcRows = Object.entries(bySource).map(([sname, cols]) =>
-      `<div class="attr-src-row"><span class="attr-src-name">${esc(sname)}</span><span class="attr-src-cols">${cols.map(esc).join(', ')}</span></div>`
-    ).join('');
-    // Show each intermediate's full definition so the reader can follow the chain
-    const intNote = intermediates.length
-      ? `<div class="attr-intermediate">
-           <div class="attr-int-label">\u26a0 Computed via intermediate column${intermediates.length > 1 ? 's' : ''} (not in any source or target DataFrame):</div>
-           ${intermediates.map(im => {
-             const loc  = im.caller ? im.caller.file_short + ':' + im.caller.line : '';
-             const refs = im.refs.length ? ' derived from: ' + im.refs.map(esc).join(', ') : '';
-             const expr = im.args.length ? im.args.map(esc).join(', ') : '';
-             return `<div class="attr-int-row">
-               <code class="attr-int-col">${esc(im.col)}</code>
-               <span class="attr-int-op">.${esc(im.operation)}()</span>
-               ${loc ? `<span class="attr-int-loc">${esc(loc)}</span>` : ''}
-               ${refs ? `<div class="attr-int-expr">${refs}</div>` : ''}
-               ${expr ? `<div class="attr-int-expr attr-int-full">${expr}</div>` : ''}
-             </div>`;
-           }).join('')}
-         </div>`
-      : '';
-    attributionHTML = `
-      <div class="trace-attribution">
-        <div class="attr-heading">Root source columns</div>
-        <div class="attr-sources">${srcRows}</div>
-        ${intNote}
+    const srcRows = [...bySource.entries()].map(([sname, cols]) => {
+      const unique = [...new Set(cols)];
+      return `<div class="flow-src-row">
+        <span class="flow-src-dfname">${esc(sname)}</span>
+        <span class="flow-src-cols">${unique.map(esc).join(', ')}</span>
       </div>`;
+    }).join('');
+    parts.push(`<div class="flow-card from"><div class="flow-card-label">From</div>${srcRows}</div>`);
   } else if (hasCreated && t.source_dfs && t.source_dfs.length) {
-    const dfNames = t.source_dfs.map(s => s.name || (s.id || '').slice(0, 8)).join(', ');
-    attributionHTML = `
-      <div class="trace-attribution">
-        <div class="attr-heading">Whole-dataset aggregate</div>
-        <div class="attr-note">This column (e.g. count(*)) does not derive from specific input columns \u2014 it aggregates across the entire dataset. Source DataFrames: <b>${esc(dfNames)}</b>.</div>
-      </div>`;
+    const dfNames = t.source_dfs.map(s => esc(s.name || (s.id || '').slice(0, 8))).join(', ');
+    parts.push(`<div class="flow-card from">
+      <div class="flow-card-label">From</div>
+      <div class="flow-src-row"><span class="flow-src-cols">Whole-dataset aggregate across: <b>${dfNames}</b></span></div>
+    </div>`);
   }
 
-  const timelineHTML = groups.map((g, i) => renderGroup(g, i)).join('');
+  // 2. Intermediate column definitions — inline in the flow
+  intermediates.forEach(im => {
+    const loc  = im.caller ? im.caller.file_short + ':' + im.caller.line : '';
+    const refs = im.refs.length ? im.refs.map(esc).join(', ') : '';
+    const expr = im.args.length ? im.args.join(', ') : '';
+    arrow();
+    parts.push(`<div class="flow-card intermediate">
+      <div class="flow-card-label"><span data-role-tip="intermediate">Via intermediate column</span></div>
+      <div class="flow-step-op"><code class="flow-int-col">${esc(im.col)}</code></div>
+      ${refs ? `<div class="flow-step-args">\u2190 ${esc(refs)}</div>` : ''}
+      ${expr ? `<div class="flow-step-args">${esc(expr)}</div>` : ''}
+      ${loc  ? `<div class="flow-step-loc">.${esc(im.operation)}() &nbsp;\u00b7 &nbsp;${esc(loc)}</div>` : ''}
+    </div>`);
+  });
+
+  // 3. Created / Modified steps (meaningful transformations only)
+  meaningfulSteps.forEach(s => {
+    arrow();
+    const op   = '.' + s.operation + '()';
+    const args = (s.args || []).join(',\\n');
+    const loc  = s.caller ? s.caller.file_short + ':' + s.caller.line : '';
+    parts.push(`<div class="flow-card ${s.role}">
+      <div class="flow-card-label"><span data-role-tip="${s.role}">${s.role === 'created' ? 'Created' : 'Modified'}</span></div>
+      <div class="flow-step-op">${esc(op)}</div>
+      ${args ? `<div class="flow-step-args">${esc(args)}</div>` : ''}
+      ${loc  ? `<div class="flow-step-loc">${esc(loc)}</div>` : ''}
+    </div>`);
+  });
+
+  // 4. Passthrough summary (replaces listing every unchanged step)
+  if (passthroughCount > 0 && meaningfulSteps.length === 0) {
+    // Pure passthrough — no transformation was ever applied
+    arrow();
+    parts.push(`<div class="flow-passthrough-note">
+      Column value unchanged \u2014 flows directly from source to output without any transformation.
+    </div>`);
+  } else if (passthroughCount > 0) {
+    arrow(`carried through ${passthroughCount} more operation${passthroughCount !== 1 ? 's' : ''} unchanged`);
+  } else if (parts.length > 0) {
+    arrow();
+  }
+
+  // 5. Output destination (the target write or DataFrame)
+  const tname = targetName(t);
+  const tloc  = t.caller ? t.caller.file_short + ':' + t.caller.line : '';
+  parts.push(`<div class="flow-card output">
+    <div class="flow-card-label">Output</div>
+    <div class="flow-out-name">${esc(tname)}</div>
+    ${tloc ? `<div class="flow-out-loc">${esc(tloc)}</div>` : ''}
+  </div>`);
 
   document.getElementById('main').innerHTML = `
     <div class="trace-header">
@@ -1300,95 +1402,8 @@ function renderTrace() {
           <button class="dl-btn" onclick="dlColHTML('${esc(STATE.activeTarget)}','${esc(STATE.activeCol)}')">&#8595;&nbsp;HTML</button>
         </div>
       </div>
-      ${attributionHTML}
     </div>
-    <div class="timeline-label">How this column was built \u2014 top is where it was created, bottom is its final state</div>
-    <div class="timeline">${timelineHTML || '<p class="empty-msg">No steps</p>'}</div>`;
-}
-
-// ── context grouping ───────────────────────────────────────────────────────
-function groupByContext(steps) {
-  const groups = []; let cur = null;
-  steps.forEach(s => {
-    if (s.role === 'source') {
-      if (cur) { groups.push(cur); cur = null; }
-      groups.push({ standalone: true, step: s });
-      return;
-    }
-    const key = s.context_key || (s.caller ? s.caller.qualname : '__none__');
-    if (!cur || cur.key !== key) {
-      if (cur) groups.push(cur);
-      cur = { key, caller: s.caller, steps: [], hasSig: false };
-    }
-    cur.steps.push(s);
-    if (s.role === 'created' || s.role === 'modified') cur.hasSig = true;
-  });
-  if (cur) groups.push(cur);
-  return groups;
-}
-
-function renderGroup(g, idx) {
-  if (g.standalone) return stepHTML(g.step);
-
-  const uid  = 'grp_' + idx + '_' + (g.key || '').replace(/[^a-z0-9]/gi,'_');
-  const caller = g.caller;
-  const label = caller ? (caller.qualname || caller.func) + '()' : 'pipeline';
-  const loc   = caller ? caller.file_short + ':' + caller.line : '';
-
-  const created     = g.steps.filter(s => s.role === 'created').length;
-  const modified    = g.steps.filter(s => s.role === 'modified').length;
-  const passthrough = g.steps.filter(s => s.role === 'passthrough').length;
-  const parts = [];
-  if (created)     parts.push(`<span style="color:#38bdf8">${created} created</span>`);
-  if (modified)    parts.push(`<span style="color:#fb923c">${modified} modified</span>`);
-  if (passthrough) parts.push(`<span style="color:#374151">${passthrough} pass</span>`);
-  const rolesHTML = parts.join(' &middot; ');
-
-  if (!(uid in GRP_COLLAPSED)) GRP_COLLAPSED[uid] = !g.hasSig;
-  const collapsed = GRP_COLLAPSED[uid];
-
-  const stepsHTML = g.steps.map(s => stepHTML(s)).join('');
-
-  return `
-    <div class="ctx-group">
-      <div class="ctx-header" onclick="toggleGrp('${uid}')">
-        <div class="ctx-info">
-          <div class="ctx-name">${esc(label)}</div>
-          ${loc ? '<div class="ctx-loc">'+esc(loc)+'</div>' : ''}
-        </div>
-        <div class="ctx-meta">
-          <span class="ctx-roles">${rolesHTML}</span>
-          <span class="ctx-toggle-icon" id="${uid}_icon">${collapsed ? '&#9660;' : '&#9650;'}</span>
-        </div>
-      </div>
-      <div class="ctx-steps${collapsed ? ' collapsed' : ''}" id="${uid}">
-        <div class="timeline">${stepsHTML}</div>
-      </div>
-    </div>`;
-}
-
-function toggleGrp(uid) {
-  GRP_COLLAPSED[uid] = !GRP_COLLAPSED[uid];
-  const el   = document.getElementById(uid);
-  const icon = document.getElementById(uid + '_icon');
-  if (el)   el.classList.toggle('collapsed', GRP_COLLAPSED[uid]);
-  if (icon) icon.innerHTML = GRP_COLLAPSED[uid] ? '&#9660;' : '&#9650;';
-}
-
-function stepHTML(s) {
-  const roleLabel = {source:'Source',created:'Created',modified:'Modified',passthrough:'Passthrough'}[s.role] || s.role;
-  const op  = s.role === 'source' ? (s.name || 'source') : '.' + s.operation + '()';
-  const args = (s.args || []).join(',\\n');
-  const loc  = s.caller ? s.caller.file_short + ':' + s.caller.line : '';
-  return `<div class="step ${s.role}">
-    <div class="step-dot"></div>
-    <div class="step-card">
-      <div class="step-role">${esc(roleLabel)}</div>
-      <div class="step-op">${esc(op)}</div>
-      ${args ? '<div class="step-args">'+esc(args)+'</div>' : ''}
-      ${loc  ? '<div class="step-loc"><span>'+esc(loc)+'</span></div>' : ''}
-    </div>
-  </div>`;
+    <div class="flow-container">${parts.join('')}</div>`;
 }
 
 // ── downloads ──────────────────────────────────────────────────────────────
@@ -1522,6 +1537,52 @@ document.addEventListener('mouseup', () => {
   dragging = false; drag.classList.remove('on');
   document.body.style.cssText = '';
 });
+
+// ── role tooltips (single definition, used everywhere via data-role-tip) ──
+// ── role definitions with code examples — single source of truth ───────────
+// Used by the tooltip. Rendered as HTML so code blocks display correctly.
+// Every [data-role-tip="X"] element in the page uses this same definition.
+const _C = "style=\\"display:block;margin-top:6px;padding:5px 8px;background:#0d1117;border-radius:4px;font-family:monospace;font-size:.67rem;color:#7dd3fc;white-space:pre\\"";
+const ROLE_TIPS = {
+  created: `<b style="color:#38bdf8">Created</b> \u2014 new column, did not exist in the source.<br>
+    <code ${_C}>df = df.withColumn('profit',\n  col('price') - col('cost'))\n# 'profit' is created</code>
+    <span style="font-size:.65rem;color:#6b7280;display:block;margin-top:4px">Any column computed by an expression that produces a name not already in the DataFrame.</span>`,
+
+  modified: `<b style="color:#fb923c">Modified</b> \u2014 column existed, but was recalculated.<br>
+    <code ${_C}>df = df.withColumn('price',\n  col('price') * 1.1)\n# 'price' existed, now changed</code>
+    <span style="font-size:.65rem;color:#6b7280;display:block;margin-top:4px">The column was already in the schema but a new expression overwrote its value.</span>`,
+
+  passthrough: `<b style="color:#94a3b8">Passthrough</b> \u2014 value unchanged end-to-end.<br>
+    <code ${_C}>df = df.withColumn('new_col', lit(1))\n# 'customer_id' already in df;\n# it passes through unchanged</code>
+    <span style="font-size:.65rem;color:#6b7280;display:block;margin-top:4px">Every pipeline step left this column alone. The value in the output is identical to what was in the source.</span>`,
+
+  intermediate: `<b style="color:#d97706">Intermediate</b> \u2014 temporary column, consumed before the output.<br>
+    <code ${_C}>df = df.withColumn('ratio',\n  col('a') / col('b'))   # intermediate\ndf = df.groupBy().agg(\n  sum('ratio'))           # ratio consumed here\n# 'ratio' is not in the final output</code>
+    <span style="font-size:.65rem;color:#6b7280;display:block;margin-top:4px">Computed mid-pipeline and used in a later expression, but not present in any source or output DataFrame.</span>`,
+};
+(function() {
+  const tip = document.createElement('div'); tip.id = 'role-tooltip'; document.body.appendChild(tip);
+  let cur = null;
+  document.addEventListener('mouseover', e => {
+    const el = e.target.closest('[data-role-tip]');
+    if (!el) { tip.style.display = 'none'; cur = null; return; }
+    if (el === cur) return;
+    cur = el;
+    const t = ROLE_TIPS[el.dataset.roleTip]; if (!t) return;
+    tip.innerHTML = t; tip.style.display = 'block';
+  });
+  document.addEventListener('mousemove', e => {
+    if (tip.style.display === 'block') {
+      tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 320) + 'px';
+      tip.style.top  = (e.clientY + 18) + 'px';
+    }
+  });
+  document.addEventListener('mouseout', e => {
+    if (!e.relatedTarget || !e.relatedTarget.closest('[data-role-tip]')) {
+      tip.style.display = 'none'; cur = null;
+    }
+  });
+})();
 
 // ── bootstrap ─────────────────────────────────────────────────────────────
 buildSourcePanel();

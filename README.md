@@ -1,67 +1,399 @@
-# spark_lineage
+<div align="center">
 
-`spark_lineage` is a Python library for runtime, column-level lineage tracking of PySpark DataFrames. You call `spl.track_df(df, "orders")` on a source DataFrame, run your pipeline normally, then call `spl.save_report(df, "./report")` to get a full lineage report — which source columns contributed to which target columns, through what transformations, and at exactly which file and line number.
+# spark-lineage
 
-## How it works
+**Runtime column-level lineage tracking for PySpark DataFrames. No static analysis. No config files.**
 
-`spark_lineage` works entirely at runtime through monkey-patching: `DataFrame.__getattribute__` (and `GroupedData.__getattribute__`) is replaced at import time, so every method call on a tracked DataFrame is intercepted transparently — no hardcoded list of method names, no static analysis, no bytecode inspection. When a transformation is intercepted, column attribution is extracted directly from Spark's analyzed query plan (`queryExecution().analyzed()`) — specifically `projectList()` and `aggregateExpressions()` — giving exact `{output_col: [referenced_input_cols]}` mappings from the same plan Spark uses to execute the query.
+[![PyPI](https://img.shields.io/pypi/v/spark-lineage?color=blue&label=PyPI)](https://pypi.org/project/spark-lineage/)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)](https://pypi.org/project/spark-lineage/)
+[![PySpark](https://img.shields.io/badge/pyspark-%3E%3D3.3-orange)](https://pypi.org/project/spark-lineage/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![CI](https://github.com/nitrajen/spark-lineage/actions/workflows/release.yml/badge.svg)](https://github.com/nitrajen/spark-lineage/actions)
 
-## What is tracked
+</div>
 
-- Source DataFrames registered via `track_df`, `session()`, or `@tracked_task`
-- Target DataFrames produced by terminal writes or captured via `save_report`
-- All transformation steps between source and target
-- Column-level attribution: which source columns each target column was derived from
-- Intermediate columns (e.g. `gross_profit = quantity * unit_price` before aggregation)
-- Caller identity (file:line, fully-qualified function name) for every step
+---
 
-## When lineage is complete vs. partial
+**[Install](#install)** | **[Quickstart](#quickstart)** | **[API](#api)** | **[Design](#design)** | **[HTML Viewer](#html-viewer)** | **[JSON Structure](#json-structure)** | **[Limitations](#limitations)** | **[In Progress](#in-progress)**
 
-**Complete lineage** (all columns traced to root sources):
+---
 
-- Any chain of `withColumn`, `select`, `filter`, `join`, `groupBy().agg()` on tracked DataFrames
-- Multi-source joins: columns from both DataFrames are attributed to their respective sources
-- Intermediate computed columns are traced through to their root origins
-
-**Partial lineage** (known gaps):
-
-- `count(*)` and `count(1)`: Spark's analyzed plan has no column-level references for wildcard aggregates. These show as "whole-dataset aggregate" with source DataFrame context but no column attribution.
-- Complex window functions: may fall back to passthrough when Spark's plan does not clearly attribute the output to specific inputs.
-- `spark.sql("SELECT ...")`: Not yet intercepted. SQL queries are invisible to the lineage tracker. (P0 — planned)
-
-**Not tracked at all**:
-
-- DataFrames created outside a `session()` context or `track_df()` call
-- DataFrames read/written in a separate process without a shared `FileStore`
-- Pure Python transformations that do not use Spark's DataFrame API
-
-## Identifying DataFrames by FQN
-
-The name shown for a source DataFrame (e.g. `"orders"`) is what was passed to `track_df(df, "orders")`. This is a user-provided alias.
-
-The fully-qualified identifier shown below the name (e.g. `pipelines.OrdersLoader.load:42`) is the actual code location where `track_df` was called — the module, class, method, and line number. **This is the stable identifier** regardless of variable names in the pipeline. In large pipelines where variables are named `df`, `df2`, etc., the FQN is how you locate the DataFrame in the codebase.
-
-To get a meaningful FQN, call `track_df` inside a named function or class method, not at module level.
-
-## Quick start
+spark-lineage tracks which source columns contributed to which output columns, through what transformations, at what file and line number. You call two functions. Everything in between is captured automatically.
 
 ```python
 import spark_lineage as spl
 
-# Mark your source DataFrames
 orders = spl.track_df(spark.read.parquet("orders"), "orders")
-products = spl.track_df(spark.read.parquet("products"), "products")
-
-# Run your pipeline normally
-result = orders.join(products, "product_id").groupBy("category").agg(...)
-
-# Generate the report
-spl.save_report(result, path="./lineage_report", name="product_summary")
+result = orders.filter(...).groupBy(...).agg(...)
+spl.save_report(result, "./report")
+# → report.html  (interactive viewer)
+# → report.json  (raw lineage data)
 ```
 
-## Running the test pipeline
+No code changes to your transformations. No decorators on each function. No schema declarations. The library monkey-patches `DataFrame.__getattribute__` at import time and intercepts every method call on tracked DataFrames transparently.
+
+## Compatibility
+
+| PySpark | Python |
+|---------|--------|
+| >= 3.3  | >= 3.11 |
+
+## Install
 
 ```bash
-python test_comprehensive.py
-open sales_lineage.html
+pip install spark-lineage
 ```
+
+---
+
+## Quickstart
+
+### Explicit tracking
+
+```python
+import spark_lineage as spl
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.getOrCreate()
+
+# Mark the source DataFrame. Everything downstream is tracked from here.
+orders = spl.track_df(spark.read.parquet("/data/orders"), "orders")
+
+enriched = (
+    orders
+    .filter(F.col("status") == "completed")
+    .withColumn("revenue", F.col("amount") * F.col("quantity"))
+    .withColumn("margin", F.col("revenue") - F.col("cost"))
+)
+
+spl.save_report(enriched, "./lineage/orders_report")
+# Writes orders_report.html and orders_report.json
+```
+
+### Session tracking (automatic)
+
+Within a `session()` block every DataFrame is registered automatically. There is no need to call `track_df` manually.
+
+```python
+with spl.session() as run_id:
+    orders   = spark.read.parquet("/data/orders")
+    products = spark.read.parquet("/data/products")
+
+    result = orders.join(products, "product_id").groupBy("category").agg(
+        F.sum("revenue").alias("total_revenue")
+    )
+    result.write.mode("overwrite").saveAsTable("reporting.category_summary")
+    spl.save_report(result, "./report")
+```
+
+### Cross-process lineage
+
+Two Airflow tasks in separate processes can share lineage via a `FileStore`. The write node in Task A is linked to the read in Task B automatically.
+
+```python
+store = spl.FileStore("/shared/.spark_lineage")
+
+# Task A
+with spl.session(run_id=context["run_id"], store=store):
+    df = spark.read.parquet("fact_orders")
+    df.write.saveAsTable("enriched_orders")
+
+# Task B (separate process, same run_id)
+with spl.session(run_id=context["run_id"], store=store):
+    df = spark.read.table("enriched_orders")   # linked to Task A's write
+    spl.save_report(df, "./report")
+```
+
+---
+
+## API
+
+### `spl.track_df(df, name)`
+
+Registers a DataFrame as a lineage root. All transformations applied to it (and DataFrames derived from it) are tracked from this point forward.
+
+```python
+orders = spl.track_df(spark.read.parquet("/data/orders"), "orders")
+```
+
+Returns the same DataFrame. The name is used as the source label in reports.
+
+### `spl.session(run_id=None, store=None)`
+
+Context manager. Inside the block, every DataFrame is tracked automatically — no `track_df` calls needed. Write operations (`df.write.parquet(...)`, `df.write.saveAsTable(...)`) are captured as target nodes in the lineage graph.
+
+```python
+with spl.session() as run_id:
+    df = spark.read.parquet(...)
+    df.write.mode("overwrite").parquet("/data/output")
+```
+
+- `run_id`: opaque string scoping this run. Defaults to a random UUID.
+- `store`: `MemoryStore()` (default, in-process) or `FileStore(path)` (cross-process).
+
+### `spl.save_report(df, path, name=None)`
+
+Generates an HTML report and a JSON data file from the current lineage state.
+
+```python
+spl.save_report(result, "./report/lineage")
+# → ./report/lineage.html
+# → ./report/lineage.json
+```
+
+### `spl.tracked_task(func)`
+
+Decorator. Any DataFrame argument entering the function that is not already tracked is registered as a lineage root automatically.
+
+```python
+@spl.tracked_task
+def build_features(orders: DataFrame, products: DataFrame) -> DataFrame:
+    return orders.join(products, "product_id").withColumn(...)
+```
+
+### `spl.build_ol_event(source_df, run_id, job_name, job_namespace)`
+
+Returns an OpenLineage `RunEvent` dict without sending it. Useful for inspection or custom transport.
+
+### `spl.emit_openlineage(source_df, url, job_name, run_id=None, job_namespace="default")`
+
+Builds and POSTs an OpenLineage COMPLETE event to a Marquez or DataHub collector.
+
+```python
+spl.emit_openlineage(result, "http://marquez:5000", job_name="preprocess_orders")
+```
+
+---
+
+## Design
+
+### How tracking works
+
+spark-lineage patches three PySpark classes at import time:
+
+- `DataFrame.__getattribute__` — every method call on a tracked DataFrame is intercepted. The return value is inspected: if it is a DataFrame, the new DataFrame is registered as a child node with the operation name, arguments, and call site.
+- `DataFrameWriter.__getattribute__` — terminal writes (`parquet`, `saveAsTable`, etc.) register a write node. Chaining calls (`mode`, `format`, `option`) propagate the source identity so the write node is still linked correctly at the end of the chain.
+- `DataFrameReader.__getattribute__` — reads look up the `LineageStore` for a prior write to the same path or table name. If found, the new DataFrame is linked to the write node, bridging lineage across process boundaries.
+
+No function names are hardcoded. Terminal vs chaining is determined purely by return type at runtime.
+
+### Column attribution
+
+Column references are extracted from Spark's own analyzed query plan, not string matching. After each transformation, spark-lineage calls `df.queryExecution().analyzed()` via the JVM bridge and reads `projectList()` or `aggregateExpressions()` to get `{output_column: [referenced_input_columns]}`. This means attribution is exact, handles aliases correctly, and works for any transformation Spark supports.
+
+### Lineage graph
+
+Every node has a UUID. The registry (`core/registry.py`) stores:
+
+- `operation` — the method name (`withColumn`, `groupBy.agg`, `write.parquet`, etc.)
+- `args_repr` — truncated repr of arguments
+- `parent_ids` — list of parent node UUIDs
+- `output_cols` — column list at this stage
+- `column_refs` — `{output_col: [input_cols]}` from the analyzed plan
+- `caller` — `CallerInfo` with file, line, and qualified function name
+
+### Targets
+
+If any `df.write.*` calls were made on descendants of the tracked source, the write nodes become the report targets. This means the report shows actual persistence operations (`write.parquet("/data/output")`, `write.saveAsTable("reporting.summary")`) rather than intermediate DataFrames. If no writes exist, the leaf DataFrames are used as targets instead.
+
+For `saveAsTable` and `insertInto`, the destination is resolved to a fully qualified name (`catalog.schema.table`) using the active Spark session's catalog API. Unity Catalog (Spark 3.4+) and legacy metastore (pre-3.4) are both handled.
+
+---
+
+## HTML Viewer
+
+The generated `.html` file is a self-contained single-page app. No server required. Open it in any browser.
+
+### Layout
+
+Two-pane layout: source panel on the left, detail panel on the right.
+
+**Source panel**
+
+- Lists all source DataFrames as collapsible accordion entries.
+- Each entry shows the source name, the qualified function name and line where it was registered, and its column list.
+- Clicking a column chip selects that source column and filters targets to those influenced by it.
+- Clicking the header expands or collapses the entry without selecting it.
+
+**Target list**
+
+- Shows all write targets (or leaf DataFrames if no writes exist).
+- Each target shows chips for all source DataFrames that feed it.
+- When a source DF is selected, targets not fed by that source are dimmed. When multiple sources are selected, only targets fed by ALL selected sources are highlighted (AND logic).
+- Clicking a target opens the target overview in the right panel.
+
+### Interaction
+
+**Source DF selection**: click a source header chip in the target list (or a column chip in the source accordion) to filter targets. Multiple sources can be selected simultaneously. AND logic: a target must use all selected sources to be highlighted.
+
+**Column mode**: click any column chip in the source accordion. The view switches to column mode, showing per-target influence counts. Selecting columns from multiple sources uses OR logic: a target is highlighted if it uses any of the selected source columns.
+
+**Target overview**: click any target to see its column breakdown. Columns are grouped by role:
+
+- **Created** — did not exist in the source; computed by this pipeline.
+- **Modified** — existed in the source but was transformed (renamed, cast, computed from other columns).
+- **Passthrough** — copied from source unchanged.
+
+Each column in the overview shows which source columns contributed to it.
+
+**Column trace**: click any column in the target overview to drill into the full derivation path, shown as a top-to-bottom flow:
+
+```
+FROM (source columns)
+  |
+VIA (intermediate columns computed along the way)
+  |
+CREATED / MODIFIED (the step that produced this column)
+  |
+carried through N steps
+  |
+OUTPUT (final column in the write target)
+```
+
+Intermediate columns are resolved recursively: if `margin_pct` was derived from `total_gross_profit`, which was derived from `gross_profit`, all three appear in the VIA block in chronological order.
+
+### Tooltips
+
+Hovering over any role term (Created, Modified, Passthrough, Intermediate) shows a tooltip with a short definition and a code example.
+
+---
+
+## JSON Structure
+
+The `.json` file produced by `save_report` contains the full lineage data. It is self-contained and can be used to build custom visualizations or feed downstream tools.
+
+```json
+{
+  "meta": {
+    "title": "string",
+    "generated_at": "ISO 8601 timestamp",
+    "source_count": 2,
+    "target_count": 3
+  },
+  "sources": [
+    {
+      "id": "hex UUID",
+      "name": "orders",
+      "primary": true,
+      "caller": {
+        "fqn": "module.function:42",
+        "file_short": "pipeline.py",
+        "line": 42
+      },
+      "columns": ["order_id", "amount", "quantity"],
+      "influence": {
+        "amount": {
+          "<target_id>": ["revenue", "margin"]
+        }
+      }
+    }
+  ],
+  "targets": [
+    {
+      "id": "hex UUID",
+      "label": "write.parquet",
+      "name": "/data/output/summary",
+      "caller": {
+        "fqn": "pipeline.run:87",
+        "file_short": "pipeline.py",
+        "line": 87
+      },
+      "source_dfs": [
+        { "id": "hex UUID", "name": "orders", "caller": { "..." : "..." } }
+      ],
+      "columns": ["category", "total_revenue", "margin_pct"],
+      "col_roles": {
+        "category": "passthrough",
+        "total_revenue": "created",
+        "margin_pct": "created"
+      },
+      "traces": {
+        "total_revenue": {
+          "sources": [
+            { "src_id": "hex UUID", "col": "amount", "src_name": "orders" }
+          ],
+          "steps": [
+            {
+              "operation": "groupBy.agg",
+              "role": "created",
+              "args": ["sum(amount)"],
+              "caller": {
+                "fqn": "pipeline.run:72",
+                "file_short": "pipeline.py",
+                "line": 72
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+**Key fields:**
+
+- `sources[].influence` — for each source column, which target columns it reaches. Keyed by `(source_id, column_name)` so same-named columns in different source DataFrames are never confused.
+- `targets[].source_dfs` — all ancestor source DataFrames, derived from the actual lineage graph. Always includes sources that contribute only via `count(*)` or join keys, even when column-level attribution is not possible.
+- `targets[].col_roles` — role classification for each output column.
+- `targets[].traces[col].steps` — ordered list of operations from source to output, each with the operation name, role, arguments, and call site.
+
+---
+
+## Limitations
+
+**Single Python process (default)**
+
+By default, lineage is in-memory and does not cross process boundaries. Use `FileStore` with a shared path to bridge across Airflow tasks or other multi-process setups. Cloud storage (`S3Store`, `HDFSStore`) is not yet implemented.
+
+**No Spark SQL**
+
+`spark.sql("SELECT ...")` is completely invisible. The library intercepts DataFrame API calls; SQL bypasses that entirely. This is the highest-priority item for future work.
+
+**No row-level tracking**
+
+Filters, joins, and limit operations change which rows appear in the output, but spark-lineage only tracks column derivation, not row provenance. A filter that removes 90% of rows is not reflected in the lineage graph.
+
+**`count(*)` and whole-dataset aggregates**
+
+When a column is produced by `count(*)`, Spark's analyzed plan has no column references. These columns appear in the report with a "whole-dataset aggregate" note and show the source DataFrame as context, but no specific source column attribution is possible.
+
+**Target labels**
+
+Targets produced by `df.write.*` calls are labeled with the write path or fully qualified table name. Targets that are intermediate DataFrames (no write) are labeled with the qualified function name and line. Variable names are not available at runtime.
+
+**Join column attribution**
+
+For columns that flow through a join from a secondary source, column-level attribution works in most cases. Aggregations that do not reference a specific column from the joined DataFrame (e.g. `count(*)` applied after a join) will not show that joined DataFrame in the column trace, though it will still appear in `source_dfs`.
+
+---
+
+## In Progress
+
+### P0 — Spark SQL support
+
+`spark.sql("SELECT ...")` is completely invisible today. Most production pipelines mix DataFrame API and SQL heavily.
+
+**Plan:** intercept `SparkSession.sql()`, parse the SQL via Spark's own parser (`spark._jsparkSession.sessionState().sqlParser()`), extract table and column references, and link them back to tracked DataFrames via registered temp views.
+
+### P1 — Better target labels
+
+Intermediate DataFrames are currently labeled by the qualified function name and line that produced them. The variable name (e.g. `enriched_orders`) is not accessible at runtime. Best workaround today: call `spl.track_df(result, "enriched_orders")` explicitly.
+
+### P2 — Cloud stores
+
+`FileStore` writes JSON to local disk. Cross-job lineage on cloud infrastructure needs `S3Store` and `HDFSStore` implementations.
+
+### P3 — Join condition in trace
+
+The column trace view shows which columns were involved in a join but does not surface the join condition itself (e.g. `orders.customer_id == customers.id`). This would make the row-filtering effect of joins more visible in the lineage report.
+
+### P4 — OpenLineage transport improvements
+
+The OpenLineage emitter currently uses a simple HTTP POST. Batching, retry logic, and async transport are not implemented.
+
+---
+
+## License
+
+[Apache 2.0](LICENSE)

@@ -44,6 +44,39 @@ def _dest_from(args, kwargs) -> str | None:
     return None
 
 
+def _resolve_fqn(op_name: str, dest: str) -> str:
+    """
+    Resolve dest to a fully-qualified identifier.
+    - Table writes (saveAsTable, insertInto): prepend current catalog + database
+      if not already qualified.  Falls back to dest unchanged on any error.
+    - File writes (parquet, csv, json, …): the path IS the identifier — returned as-is.
+    """
+    if op_name not in ("saveAsTable", "insertInto"):
+        return dest  # file path — no resolution needed
+    if not dest:
+        return dest
+    parts = dest.split(".")
+    if len(parts) >= 3:
+        return dest  # already catalog.schema.table
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        if not spark:
+            return dest
+        db = spark.catalog.currentDatabase()
+        try:
+            cat = spark.catalog.currentCatalog()   # Spark 3.4+ / Unity Catalog
+            if len(parts) == 1:
+                return f"{cat}.{db}.{dest}"
+            else:                                  # schema.table
+                return f"{cat}.{dest}"
+        except Exception:
+            # Pre-3.4 Spark — no currentCatalog
+            return f"{db}.{dest}" if len(parts) == 1 else dest
+    except Exception:
+        return dest
+
+
 def _safe_repr(val) -> str:
     try:
         r = repr(val)
@@ -63,6 +96,9 @@ def _wrap_write(source_id: str, op_name: str, method):
             node = _registry.get(source_id)
             out_cols = list(node.output_cols) if node else []
 
+            dest = _dest_from(args, kwargs)
+            fqn  = _resolve_fqn(op_name, dest) if dest else None
+
             write_id = uuid4().hex
             _registry.register_child(
                 write_id,
@@ -71,9 +107,9 @@ def _wrap_write(source_id: str, op_name: str, method):
                 args_repr=[_safe_repr(a) for a in args],
                 caller=caller,
                 output_cols=out_cols,
+                name=fqn or dest,   # FQN for tables, path for files
             )
 
-            dest = _dest_from(args, kwargs)
             if dest and _session_store is not None and _session_run_id is not None:
                 _session_store.save(_session_run_id, dest, write_id, out_cols)
 

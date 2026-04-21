@@ -472,13 +472,22 @@ def load_sources(spark):
     return orders, customers, products, campaigns
 
 
-# ── Run pipeline ──────────────────────────────────────────────────────────────
+# ── Run pipeline + write outputs ──────────────────────────────────────────────
+
+import tempfile, os as _os
+_out = _os.path.join(tempfile.gettempdir(), "spark_lineage_test")
 
 orders, customers, products, campaigns = load_sources(spark)
 pipeline = SalesAnalyticsPipeline()
 ltv, perf, trends, campaign_eff = pipeline.run(orders, customers, products, campaigns)
 
-# ── Generate report (before any display calls so pipeline outputs are leaves) ─
+# Write outputs — these become the lineage targets instead of Python variables
+ltv.write.mode("overwrite").parquet(_os.path.join(_out, "customer_lifetime_value"))
+perf.write.mode("overwrite").parquet(_os.path.join(_out, "product_performance"))
+trends.write.mode("overwrite").parquet(_os.path.join(_out, "monthly_channel_trends"))
+campaign_eff.write.mode("overwrite").parquet(_os.path.join(_out, "channel_campaign_efficiency"))
+
+# ── Generate report ────────────────────────────────────────────────────────────
 
 spl.save_report(orders, path="./sales_lineage", name="Sales Analytics Pipeline")
 
