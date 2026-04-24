@@ -3,6 +3,7 @@ from .core.registry import _registry
 from .core import tracked_df as _tdf
 from .core import tracked_writer as _twr
 from .core import tracked_reader as _trd
+from .core import tracked_session as _tsql
 from .core.store import LineageStore, MemoryStore, FileStore
 from .report import print_lineage, get_lineage, save_report
 from .serve import serve_report
@@ -82,6 +83,7 @@ def session(run_id: str = None, store: LineageStore = None):
     _tdf._session_active = True
     _twr._set_session(_rid, _store)
     _trd._set_session(_rid, _store, active=True)
+    _tsql._set_session(active=True)
 
     try:
         yield _rid
@@ -89,6 +91,7 @@ def session(run_id: str = None, store: LineageStore = None):
         _tdf._session_active = False
         _twr._set_session(None, None)
         _trd._set_session(None, None, active=False)
+        _tsql._set_session(active=False)
 
 
 def tracked_task(func):

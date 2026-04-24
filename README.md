@@ -2,7 +2,7 @@
 
 # spark-lineage
 
-**Runtime column-level lineage tracking for PySpark DataFrames. No static analysis. No config files.**
+**Column-level lineage tracking for PySpark DataFrames. No decorators. No schema declarations. No code changes.**
 
 [![PyPI](https://img.shields.io/pypi/v/spark-lineage?color=blue&label=PyPI)](https://pypi.org/project/spark-lineage/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)](https://pypi.org/project/spark-lineage/)
@@ -18,7 +18,9 @@
 
 ---
 
-spark-lineage tracks which source columns contributed to which output columns, through what transformations, at what file and line number. You call two functions. Everything in between is captured automatically.
+The first obstacle developers often stumble upon when studying or updating large data pipelines is the source to target lineage. Dataset-level lineage is useless because the granularity of change is often at a column-level. spark-lineage implements column-level lineage for PySpark DataFrames by monkey-patching `DataFrame.__getattribute__` at import time — every method call on a tracked DataFrame is intercepted transparently, and column attribution is extracted directly from Spark's analyzed query plan.
+
+Register a source DataFrame and get two outputs from the same lineage graph: an interactive HTML report and a queryable JSON file.
 
 ```python
 import spark_lineage as spl
@@ -27,10 +29,8 @@ orders = spl.track_df(spark.read.parquet("orders"), "orders")
 result = orders.filter(...).groupBy(...).agg(...)
 spl.save_report(result, "./report")
 # → report.html  (interactive viewer)
-# → report.json  (raw lineage data)
+# → report.json  (queryable lineage data)
 ```
-
-No code changes to your transformations. No decorators on each function. No schema declarations. The library monkey-patches `DataFrame.__getattribute__` at import time and intercepts every method call on tracked DataFrames transparently.
 
 ## Compatibility
 
@@ -167,36 +167,13 @@ spl.emit_openlineage(result, "http://marquez:5000", job_name="preprocess_orders"
 
 ## Design
 
-### How tracking works
+spark-lineage patches four PySpark entry points at import time: `DataFrame.__getattribute__`, `DataFrameWriter.__getattribute__`, `DataFrameReader.__getattribute__`, and `SparkSession.sql`. This means every method call on a tracked DataFrame — and every SQL query that references a temp view of one — is intercepted without a hardcoded list of method names. Terminal writes vs chaining calls are distinguished purely by return type at runtime.
 
-spark-lineage patches three PySpark classes at import time:
+Column attribution does not use string matching or static analysis. After each transformation, spark-lineage walks `df.queryExecution().analyzed()` via the JVM bridge and reads `projectList()` or `aggregateExpressions()` directly from Spark's own analyzed plan. The result is an exact `{output_column: [referenced_input_columns]}` map that handles aliases, renames, and multi-source joins correctly — because it comes from the same plan Spark uses to execute the query.
 
-- `DataFrame.__getattribute__` — every method call on a tracked DataFrame is intercepted. The return value is inspected: if it is a DataFrame, the new DataFrame is registered as a child node with the operation name, arguments, and call site.
-- `DataFrameWriter.__getattribute__` — terminal writes (`parquet`, `saveAsTable`, etc.) register a write node. Chaining calls (`mode`, `format`, `option`) propagate the source identity so the write node is still linked correctly at the end of the chain.
-- `DataFrameReader.__getattribute__` — reads look up the `LineageStore` for a prior write to the same path or table name. If found, the new DataFrame is linked to the write node, bridging lineage across process boundaries.
+Each node in the lineage graph carries the operation name, a truncated repr of its arguments, its parent node UUIDs, the column list at that stage, the column reference map from the analyzed plan, and the call site (file, line, qualified function name).
 
-No function names are hardcoded. Terminal vs chaining is determined purely by return type at runtime.
-
-### Column attribution
-
-Column references are extracted from Spark's own analyzed query plan, not string matching. After each transformation, spark-lineage calls `df.queryExecution().analyzed()` via the JVM bridge and reads `projectList()` or `aggregateExpressions()` to get `{output_column: [referenced_input_columns]}`. This means attribution is exact, handles aliases correctly, and works for any transformation Spark supports.
-
-### Lineage graph
-
-Every node has a UUID. The registry (`core/registry.py`) stores:
-
-- `operation` — the method name (`withColumn`, `groupBy.agg`, `write.parquet`, etc.)
-- `args_repr` — truncated repr of arguments
-- `parent_ids` — list of parent node UUIDs
-- `output_cols` — column list at this stage
-- `column_refs` — `{output_col: [input_cols]}` from the analyzed plan
-- `caller` — `CallerInfo` with file, line, and qualified function name
-
-### Targets
-
-If any `df.write.*` calls were made on descendants of the tracked source, the write nodes become the report targets. This means the report shows actual persistence operations (`write.parquet("/data/output")`, `write.saveAsTable("reporting.summary")`) rather than intermediate DataFrames. If no writes exist, the leaf DataFrames are used as targets instead.
-
-For `saveAsTable` and `insertInto`, the destination is resolved to a fully qualified name (`catalog.schema.table`) using the active Spark session's catalog API. Unity Catalog (Spark 3.4+) and legacy metastore (pre-3.4) are both handled.
+Report targets are write nodes, not intermediate DataFrames. When `df.write.parquet(...)` or `df.write.saveAsTable(...)` is called anywhere in the pipeline, those become the targets in the report. For `saveAsTable` and `insertInto`, the destination is resolved to a fully qualified name (`catalog.schema.table`) using the active Spark session's catalog API, with support for both Unity Catalog (Spark 3.4+) and the legacy metastore.
 
 ---
 
@@ -346,10 +323,6 @@ The `.json` file produced by `save_report` contains the full lineage data. It is
 
 By default, lineage is in-memory and does not cross process boundaries. Use `FileStore` with a shared path to bridge across Airflow tasks or other multi-process setups. Cloud storage (`S3Store`, `HDFSStore`) is not yet implemented.
 
-**No Spark SQL**
-
-`spark.sql("SELECT ...")` is completely invisible. The library intercepts DataFrame API calls; SQL bypasses that entirely. This is the highest-priority item for future work.
-
 **No row-level tracking**
 
 Filters, joins, and limit operations change which rows appear in the output, but spark-lineage only tracks column derivation, not row provenance. A filter that removes 90% of rows is not reflected in the lineage graph.
@@ -370,11 +343,9 @@ For columns that flow through a join from a secondary source, column-level attri
 
 ## In Progress
 
-### P0 — Spark SQL support
+### P0 — Spark SQL support ✓ Done
 
-`spark.sql("SELECT ...")` is completely invisible today. Most production pipelines mix DataFrame API and SQL heavily.
-
-**Plan:** intercept `SparkSession.sql()`, parse the SQL via Spark's own parser (`spark._jsparkSession.sessionState().sqlParser()`), extract table and column references, and link them back to tracked DataFrames via registered temp views.
+`spark.sql("SELECT ...")` is fully tracked. Register a temp view from any tracked DataFrame via `df.createOrReplaceTempView("name")`, then query it with `spark.sql(...)` — the result is linked back to its source DataFrames automatically. Column attribution is extracted from Spark's analyzed plan, same as the DataFrame API.
 
 ### P1 — Better target labels
 

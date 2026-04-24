@@ -487,6 +487,48 @@ perf.write.mode("overwrite").parquet(_os.path.join(_out, "product_performance"))
 trends.write.mode("overwrite").parquet(_os.path.join(_out, "monthly_channel_trends"))
 campaign_eff.write.mode("overwrite").parquet(_os.path.join(_out, "channel_campaign_efficiency"))
 
+# ── SQL branch (E): register temp views then query via spark.sql() ─────────────
+# This tests Spark SQL compatibility: views of tracked DataFrames are resolved
+# back to their lineage parents transparently.
+
+orders.createOrReplaceTempView("orders_v")
+customers.createOrReplaceTempView("customers_v")
+products.createOrReplaceTempView("products_v")
+
+sql_channel_segment = spark.sql("""
+    SELECT
+        o.channel,
+        c.segment,
+        COUNT(*)                                                        AS order_count,
+        ROUND(SUM(o.quantity * o.unit_price * (1 - o.discount_rate)), 2) AS net_revenue,
+        ROUND(AVG(o.discount_rate) * 100, 1)                            AS avg_discount_pct
+    FROM orders_v   o
+    JOIN customers_v c ON o.customer_id = c.customer_id
+    WHERE o.status = 'completed'
+    GROUP BY o.channel, c.segment
+    ORDER BY net_revenue DESC
+""")
+sql_channel_segment.write.mode("overwrite").parquet(
+    _os.path.join(_out, "sql_channel_segment")
+)
+
+sql_top_products = spark.sql("""
+    SELECT
+        p.product_name,
+        p.category,
+        SUM(o.quantity)                                           AS units_sold,
+        ROUND(SUM(o.quantity * o.unit_price), 2)                  AS gross_revenue,
+        ROUND(SUM(o.quantity * (o.unit_price - p.unit_cost)), 2)  AS gross_profit
+    FROM orders_v   o
+    JOIN products_v p ON o.product_id = p.product_id
+    WHERE o.status = 'completed'
+    GROUP BY p.product_name, p.category
+    ORDER BY gross_profit DESC
+""")
+sql_top_products.write.mode("overwrite").parquet(
+    _os.path.join(_out, "sql_top_products")
+)
+
 # ── Generate report ────────────────────────────────────────────────────────────
 
 spl.save_report(orders, path="./sales_lineage", name="Sales Analytics Pipeline")
