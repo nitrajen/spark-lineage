@@ -529,6 +529,32 @@ sql_top_products.write.mode("overwrite").parquet(
     _os.path.join(_out, "sql_top_products")
 )
 
+# ── Post-write continuation (F): lineage continues after a write ───────────────
+# Verifies that writing a DataFrame to storage and then continuing to transform
+# it produces two independent write targets — both appear in the lineage graph.
+
+enriched_orders = (
+    orders
+    .filter(F.col("status") == "completed")
+    .withColumn("line_revenue", F.round(F.col("quantity") * F.col("unit_price"), 2))
+)
+enriched_orders.write.mode("overwrite").parquet(
+    _os.path.join(_out, "enriched_orders")
+)
+
+# Continue transforming AFTER the write — this must also appear as a target.
+summary_orders = (
+    enriched_orders
+    .groupBy("channel")
+    .agg(
+        F.round(F.sum("line_revenue"), 2).alias("channel_revenue"),
+        F.count("*").alias("order_count"),
+    )
+)
+summary_orders.write.mode("overwrite").parquet(
+    _os.path.join(_out, "channel_summary")
+)
+
 # ── Generate report ────────────────────────────────────────────────────────────
 
 spl.save_report(orders, path="./sales_lineage", name="Sales Analytics Pipeline")

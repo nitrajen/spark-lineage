@@ -4,11 +4,10 @@ from .core import tracked_df as _tdf
 from .core import tracked_writer as _twr
 from .core import tracked_reader as _trd
 from .core import tracked_session as _tsql
-from .core.store import LineageStore, MemoryStore, FileStore
-from .report import print_lineage, get_lineage, save_report
+from .core.store import LineageStore, FileStore
+from .report import save_report
 from .serve import serve_report
 from .openlineage import build_event as build_ol_event, emit as emit_openlineage
-from .core.column_lineage import get_col_lineage
 from uuid import uuid4
 import functools
 from contextlib import contextmanager

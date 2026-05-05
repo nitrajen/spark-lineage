@@ -26,6 +26,44 @@ _BASE = object.__getattribute__   # bypass all overrides safely
 
 # ── column reference extraction via analyzed plan ─────────────────────────────
 
+def _extract_join_condition(result_df) -> str | None:
+    """
+    Walk the analyzed plan of a join result to find the Join node and return
+    its condition as a SQL string.  Returns None if no condition is found
+    (e.g. cross join) or if the plan cannot be inspected.
+    """
+    try:
+        plan = result_df._jdf.queryExecution().analyzed()
+        stack = [plan]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            try:
+                nid = node.hashCode()
+                if nid in seen:
+                    continue
+                seen.add(nid)
+            except Exception:
+                continue
+            try:
+                if node.getClass().getSimpleName() == "Join":
+                    cond = node.condition()
+                    if cond.isDefined():
+                        return str(cond.get().sql())
+                    return None
+            except Exception:
+                pass
+            try:
+                children = node.children()
+                for i in range(children.size()):
+                    stack.append(children.apply(i))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
 def _extract_col_refs_from_plan(result_df) -> dict:
     """
     After a transformation executes, extract {output_col: [referenced_input_cols]}
@@ -85,11 +123,24 @@ def _wrap(source_id: str, op_name: str, method):
             ]
             parent_ids = [source_id] + [p for p in extra_parents if p and p != source_id]
             col_refs   = _extract_col_refs_from_plan(result)
+
+            # For joins, replace the raw Column/DataFrame reprs with the SQL
+            # condition extracted from the analyzed plan — much more readable.
+            if op_name == "join":
+                join_cond = _extract_join_condition(result)
+                how = kwargs.get("how", "inner")
+                if join_cond:
+                    args_repr = [f"on: {join_cond}", f"how: {how}"]
+                else:
+                    args_repr = [f"how: {how}"]
+            else:
+                args_repr = [_safe_repr(a) for a in args]
+
             _registry.register_child(
                 child_id,
                 parent_ids=parent_ids,
                 operation=op_name,
-                args_repr=[_safe_repr(a) for a in args],
+                args_repr=args_repr,
                 caller=caller,
                 output_cols=out_cols,
                 column_refs=col_refs,

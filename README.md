@@ -129,7 +129,7 @@ with spl.session() as run_id:
 ```
 
 - `run_id`: opaque string scoping this run. Defaults to a random UUID.
-- `store`: `MemoryStore()` (default, in-process) or `FileStore(path)` (cross-process).
+- `store`: in-process by default. Pass `FileStore(path)` for cross-process lineage.
 
 ### `spl.save_report(df, path, name=None)`
 
@@ -343,10 +343,6 @@ For columns that flow through a join from a secondary source, column-level attri
 
 ## In Progress
 
-### P0 — Spark SQL support ✓ Done
-
-`spark.sql("SELECT ...")` is fully tracked. Register a temp view from any tracked DataFrame via `df.createOrReplaceTempView("name")`, then query it with `spark.sql(...)` — the result is linked back to its source DataFrames automatically. Column attribution is extracted from Spark's analyzed plan, same as the DataFrame API.
-
 ### P1 — Better target labels
 
 Intermediate DataFrames are currently labeled by the qualified function name and line that produced them. The variable name (e.g. `enriched_orders`) is not accessible at runtime. Best workaround today: call `spl.track_df(result, "enriched_orders")` explicitly.
@@ -355,13 +351,9 @@ Intermediate DataFrames are currently labeled by the qualified function name and
 
 `FileStore` writes JSON to local disk. Cross-job lineage on cloud infrastructure needs `S3Store` and `HDFSStore` implementations.
 
-### P3 — Join condition in trace
+### P3 — OpenLineage end-to-end test
 
-The column trace view shows which columns were involved in a join but does not surface the join condition itself (e.g. `orders.customer_id == customers.id`). This would make the row-filtering effect of joins more visible in the lineage report.
-
-### P4 — OpenLineage transport improvements
-
-The OpenLineage emitter currently uses a simple HTTP POST. Batching, retry logic, and async transport are not implemented.
+The OpenLineage emitter (`spl.emit_openlineage`) builds and POSTs a standards-compliant event. Needs an end-to-end test against a live Marquez instance before being documented as production-ready.
 
 ---
 
