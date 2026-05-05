@@ -4,6 +4,12 @@ Only tracked DataFrames (those with _dfi_id set) pay any interception cost.
 
 Session mode: when _session_active is True, any DataFrame that hasn't been
 explicitly tracked is auto-registered as a root on its first method call.
+
+Design: interception is purely return-type-based — no method names are
+hardcoded in the transformation path.  The one exception is _VIEW_METHODS:
+view-registration calls return None like show()/explain(), so return type
+alone cannot distinguish them.  That set is the complete stable PySpark API
+for temp view creation and is not business logic.
 """
 
 import functools
@@ -17,20 +23,29 @@ from .node import CallerInfo
 # Set to True inside a dfi.session() context to auto-track all DataFrames.
 _session_active: bool = False
 
-# Methods that register a view as a side effect (return None).
-# Small, stable PySpark Catalog API — not business logic.
-_VIEW_METHODS = {"createOrReplaceTempView", "createTempView", "createGlobalTempView"}
+# Complete set of DataFrame methods that register a temp view as a side effect
+# and return None.  Return type alone cannot distinguish these from show(),
+# explain(), etc.  This is PySpark API surface knowledge, not business logic.
+_VIEW_METHODS = {
+    "createTempView",
+    "createOrReplaceTempView",
+    "createGlobalTempView",
+    "createOrReplaceGlobalTempView",
+    "registerTempTable",            # deprecated alias, still in the API
+}
 
 _BASE = object.__getattribute__   # bypass all overrides safely
 
 
-# ── column reference extraction via analyzed plan ─────────────────────────────
+# ── plan helpers ──────────────────────────────────────────────────────────────
 
 def _extract_join_condition(result_df) -> str | None:
     """
     Walk the analyzed plan of a join result to find the Join node and return
     its condition as a SQL string.  Returns None if no condition is found
     (e.g. cross join) or if the plan cannot be inspected.
+
+    No method name check — the plan tells us what happened.
     """
     try:
         plan = result_df._jdf.queryExecution().analyzed()
@@ -109,13 +124,22 @@ def _wrap(source_id: str, op_name: str, method):
         result = method(*args, **kwargs)
 
         if isinstance(result, DataFrame):
+            # cache(), persist(), unpersist() return `self` — the same object.
+            # Detect this by checking whether _dfi_id is already set to source_id.
+            # These are not transformations; don't create a new lineage node.
+            existing_id = _BASE(result, "__dict__").get("_dfi_id")
+            if existing_id == source_id:
+                return result
+
             child_id = uuid4().hex
             result._dfi_id = child_id
             try:
                 out_cols = list(result.columns)
             except Exception:
                 out_cols = []
-            # Collect any tracked DataFrames passed as arguments (e.g. join's right side)
+
+            # Collect any tracked DataFrames passed as arguments (e.g. join's right side,
+            # union's other side).
             extra_parents = [
                 _BASE(a, "__dict__").get("_dfi_id")
                 for a in args
@@ -124,10 +148,9 @@ def _wrap(source_id: str, op_name: str, method):
             parent_ids = [source_id] + [p for p in extra_parents if p and p != source_id]
             col_refs   = _extract_col_refs_from_plan(result)
 
-            # Try to extract a join condition from the plan.  If the result's
-            # analyzed plan contains a Join node, use its SQL condition string
-            # instead of the raw Python arg reprs (Column objects are unreadable).
-            # No operation name check — the plan tells us what happened.
+            # Try to extract a join condition from the plan.  If a Join node is
+            # present, use its SQL condition string — far more readable than
+            # Column object reprs.  No name check — the plan determines this.
             join_cond = _extract_join_condition(result)
             if join_cond:
                 how = kwargs.get("how", "inner")
@@ -145,14 +168,33 @@ def _wrap(source_id: str, op_name: str, method):
                 column_refs=col_refs,
             )
 
+        elif isinstance(result, list) and result and all(isinstance(r, DataFrame) for r in result):
+            # randomSplit() returns list[DataFrame] — track each split as a child.
+            for i, split_df in enumerate(result):
+                split_id = uuid4().hex
+                split_df._dfi_id = split_id
+                try:
+                    out_cols = list(split_df.columns)
+                except Exception:
+                    out_cols = []
+                _registry.register_child(
+                    split_id,
+                    parent_ids=[source_id],
+                    operation=f"{op_name}[{i}]",
+                    args_repr=[_safe_repr(a) for a in args],
+                    caller=caller,
+                    output_cols=out_cols,
+                    column_refs={},
+                )
+
         elif isinstance(result, GroupedData):
-            # Propagate tracking through groupBy so .agg() result is also tracked
+            # Propagate tracking through groupBy/rollup/cube so .agg() is tracked.
             result._dfi_id = source_id
             result._dfi_groupby_op = op_name
             result._dfi_groupby_args = [_safe_repr(a) for a in args]
             result._dfi_groupby_caller = caller
 
-        elif op_name in _VIEW_METHODS and args:
+        elif result is None and op_name in _VIEW_METHODS and args:
             _registry.register_view(str(args[0]), source_id)
 
         return result
