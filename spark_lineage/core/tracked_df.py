@@ -124,15 +124,14 @@ def _wrap(source_id: str, op_name: str, method):
             parent_ids = [source_id] + [p for p in extra_parents if p and p != source_id]
             col_refs   = _extract_col_refs_from_plan(result)
 
-            # For joins, replace the raw Column/DataFrame reprs with the SQL
-            # condition extracted from the analyzed plan — much more readable.
-            if op_name == "join":
-                join_cond = _extract_join_condition(result)
+            # Try to extract a join condition from the plan.  If the result's
+            # analyzed plan contains a Join node, use its SQL condition string
+            # instead of the raw Python arg reprs (Column objects are unreadable).
+            # No operation name check — the plan tells us what happened.
+            join_cond = _extract_join_condition(result)
+            if join_cond:
                 how = kwargs.get("how", "inner")
-                if join_cond:
-                    args_repr = [f"on: {join_cond}", f"how: {how}"]
-                else:
-                    args_repr = [f"how: {how}"]
+                args_repr = [f"on: {join_cond}", f"how: {how}"]
             else:
                 args_repr = [_safe_repr(a) for a in args]
 
